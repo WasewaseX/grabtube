@@ -38,6 +38,9 @@ next-env.d.ts
 /downloads/
 /download/
 
+# project-local toolchain binaries (installed by scripts/setup-tools.sh)
+/tools/
+
 # vendored third-party code (installed by scripts/setup-tools.sh)
 /mini-services/pot-provider/
 

@@ -16,7 +16,10 @@ function firstExisting(candidates: string[]): string | null {
   return null
 }
 
+const PROJECT_ROOT = '/home/z/my-project'
+
 const YT_DLP_CANDIDATES = [
+  path.join(PROJECT_ROOT, 'tools/venv/bin/yt-dlp'), // project-local (survives home resets)
   '/home/z/.venv/bin/yt-dlp',
   '/usr/local/bin/yt-dlp',
   '/usr/bin/yt-dlp',
@@ -26,24 +29,30 @@ const YT_DLP_CANDIDATES = [
 
 const FFMPEG_CANDIDATES = ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/home/linuxbrew/.linuxbrew/bin/ffmpeg']
 
-const DENO_CANDIDATES = ['/home/z/.deno/bin/deno', path.join(os.homedir(), '.deno/bin/deno'), '/usr/local/bin/deno']
+const DENO_CANDIDATES = [
+  path.join(PROJECT_ROOT, 'tools/deno/bin/deno'), // project-local (survives home resets)
+  '/home/z/.deno/bin/deno',
+  path.join(os.homedir(), '.deno/bin/deno'),
+  '/usr/local/bin/deno',
+]
 
 let ytDlpPath: string | null = null
 let ffmpegPath: string | null = null
 let denoPath: string | null = null
 
+// re-resolve if the cached binary vanished (e.g. sandbox home resets)
 export function getYtDlpPath(): string {
-  if (!ytDlpPath) ytDlpPath = firstExisting(YT_DLP_CANDIDATES) ?? 'yt-dlp'
+  if (!ytDlpPath || !existsSync(ytDlpPath)) ytDlpPath = firstExisting(YT_DLP_CANDIDATES) ?? 'yt-dlp'
   return ytDlpPath
 }
 
 export function getFfmpegPath(): string {
-  if (!ffmpegPath) ffmpegPath = firstExisting(FFMPEG_CANDIDATES) ?? 'ffmpeg'
+  if (!ffmpegPath || !existsSync(ffmpegPath)) ffmpegPath = firstExisting(FFMPEG_CANDIDATES) ?? 'ffmpeg'
   return ffmpegPath
 }
 
 export function getDenoPath(): string {
-  if (!denoPath) denoPath = firstExisting(DENO_CANDIDATES) ?? 'deno'
+  if (!denoPath || !existsSync(denoPath)) denoPath = firstExisting(DENO_CANDIDATES) ?? 'deno'
   return denoPath
 }
 

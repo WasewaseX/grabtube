@@ -352,8 +352,56 @@ export function laneSnapshot(): LaneStatus[] {
 /* Boot                                                                */
 /* ------------------------------------------------------------------ */
 
+/** Self-healing: if the WARP tunnel is dead AND no wireproxy is listening,
+ *  (re)spawn the warp-proxy mini-service from inside the Next.js process —
+ *  sandboxes kill detached services between sessions, so the app revives its
+ *  own tunnel the same way it revives the PO-token server. */
+declare global {
+  var __tgWarpSupervisorStarted: boolean | undefined;
+}
+
+function ensureWarpService(): void {
+  if (globalThis.__tgWarpSupervisorStarted) return;
+  globalThis.__tgWarpSupervisorStarted = true;
+  const check = async () => {
+    try {
+      const lane = state().lanes.find((l) => l.id === "warp");
+      if (lane?.healthy) return; // tunnel alive, nothing to do
+    } catch {
+      /* ignore */
+    }
+    try {
+      const probe = await fetch("https://www.cloudflare.com/cdn-cgi/trace", {
+        signal: AbortSignal.timeout(4000),
+      });
+      void probe.body?.cancel().catch(() => undefined);
+    } catch {
+      /* network down entirely — still try to spawn */
+    }
+    const { spawn } = await import("child_process");
+    const { existsSync } = await import("fs");
+    const dir = "/home/z/my-project/mini-services/warp-proxy";
+    if (!existsSync(`${dir}/index.ts`)) return;
+    console.log("[proxy] warp lane unhealthy — spawning warp-proxy service");
+    try {
+      const child = spawn("bun", ["run", "index.ts"], {
+        cwd: dir,
+        detached: true,
+        stdio: "ignore",
+        env: process.env,
+      });
+      child.unref();
+    } catch (e) {
+      console.error(`[proxy] warp service spawn failed: ${String(e).slice(0, 90)}`);
+    }
+  };
+  setTimeout(() => void check(), 6000);
+  setInterval(() => void check(), 3 * 60_000);
+}
+
 if (!globalThis.__tgProxyBooted) {
   globalThis.__tgProxyBooted = true;
+  ensureWarpService();
   setTimeout(() => void probeAll(), 500);
   setInterval(() => void probeAll(), 60_000);
   // keep-alive the agents so sockets through the tunnel stay warm

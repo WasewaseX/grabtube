@@ -1,0 +1,61 @@
+# dependencies
+node_modules
+/.pnp
+.pnp.*
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug / logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+*.log
+dev.log
+dev.out.log
+server.log
+
+# env files
+.env
+.env.*
+!.env.example
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# app data (runtime artifacts — never commit)
+/db/
+/downloads/
+/download/
+
+# vendored third-party code (installed by scripts/setup-tools.sh)
+/mini-services/pot-provider/
+
+# internal ops
+/worklog.md
+/prompt
+/test
+/local-*
+.claude
+.z-ai-config
+.vercel
+/skills/
+/tests/
+/examples/
+/tmp/
+
+# never commit credentials of any kind
+*.pat
+*_token*
+*.pem
+*.key

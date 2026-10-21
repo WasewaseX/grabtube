@@ -1,0 +1,45 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Download {
+  id         String   @id @default(cuid())
+  videoId    String
+  url        String
+  title      String   @default("")
+  thumbnail  String?
+  duration   Int?
+  channel    String?
+  mode       String   @default("video") // video | audio
+  quality    String   @default("best")
+  codec      String   @default("h264") // h264 | vp9 | av1 | opus
+  container  String   @default("mp4")
+  status     String   @default("pending") // pending | downloading | processing | completed | failed | canceled
+  stage      String   @default("") // extract | download | merge | extract_audio
+  progress   Float    @default(0)
+  speed      String?
+  eta        String?
+  filesize   Int?
+  filename   String?
+  filepath   String?
+  error      String?
+  attempts   Int      @default(0)
+  strategy   String?  // which extraction strategy succeeded
+  directUrl  String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+model Setting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}

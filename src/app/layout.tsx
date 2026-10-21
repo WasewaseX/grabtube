@@ -4,7 +4,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { ThemeProvider } from "@/components/theme-provider";
 
 export const metadata: Metadata = {
-  title: "TubeGrab — Fast YouTube Downloader",
+  title: "YouWee — YouTube Downloader",
   description:
     "Download YouTube videos and audio in any quality and codec through a consumer-grade WARP tunnel with PO-tokens and community proxy fallbacks. Resumable, IDM-compatible direct links. Built for slow and censored networks.",
   icons: {

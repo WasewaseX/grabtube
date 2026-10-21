@@ -390,6 +390,8 @@ function ensureWarpService(): void {
         stdio: "ignore",
         env: process.env,
       });
+      // async spawn errors (ENOENT etc.) must never escape as uncaughtException
+      child.on("error", () => undefined);
       child.unref();
     } catch (e) {
       console.error(`[proxy] warp service spawn failed: ${String(e).slice(0, 90)}`);

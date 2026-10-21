@@ -13,7 +13,7 @@
  */
 import { spawn, type ChildProcess } from "child_process";
 import { randomUUID } from "crypto";
-import { existsSync, mkdirSync, statSync, rmSync } from "fs";
+import { existsSync, mkdirSync, statSync, rmSync, statfsSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
 
@@ -162,6 +162,8 @@ export interface CreateJobInput {
   mode: "merge" | "mp3" | "urlmerge" | "urlaudio";
   videoFormatId?: string; // composite "videoId|audioId|container" for merge
   bitrate?: number;
+  /** target container for audio-conversion jobs (mp3/m4a/opus/flac/wav) */
+  audioFormat?: string;
   webpageUrl?: string;
   title?: string;
   duration?: number;
@@ -200,6 +202,22 @@ export function createJob(input: CreateJobInput): Job {
   const entry = getInfo(input.infoId);
   if (!entry) throw new DlError("EXPIRED", "This video's session expired. Fetch it again.");
 
+  // disk pre-flight: merge jobs buffer video+audio in tmp before muxing — a
+  // full disk otherwise surfaces as a cryptic ENOSPC error at 98% done
+  try {
+    const s = statfsSync(jobsDir());
+    const freeBytes = s.bsize * s.bavail;
+    if (freeBytes < 1.2 * 1024 * 1024 * 1024) {
+      throw new DlError(
+        "DISK_FULL",
+        "Server disk is almost full — clear finished downloads (or old job files) and try again.",
+      );
+    }
+  } catch (e) {
+    if (e instanceof DlError) throw e;
+    /* statfs unavailable — skip the guard */
+  }
+
   const raw = entry.raw;
   const title = sanitizeFilename(input.title || raw.title || "video");
   const durationSec = input.duration || raw.duration || 0;
@@ -211,9 +229,13 @@ export function createJob(input: CreateJobInput): Job {
   let mode = input.mode;
 
   if (mode === "mp3") {
-    ext = "mp3";
+    // mode "mp3" covers every audio conversion target (mp3/m4a/opus/flac/wav)
+    const target = ["mp3", "m4a", "opus", "flac", "wav"].includes(input.audioFormat ?? "")
+      ? (input.audioFormat as string)
+      : "mp3";
+    ext = target;
     engine = "ytdlp";
-    const bitrate = [320, 192, 128].includes(input.bitrate || 0) ? input.bitrate : 192;
+    const bitrate = [320, 192, 128].includes(input.bitrate || 0) ? input.bitrate : 320;
     args = [
       ...baseArgs(),
       // same client chain as extraction, or the job re-resolves on a different
@@ -225,9 +247,11 @@ export function createJob(input: CreateJobInput): Job {
       "bestaudio/best",
       "-x",
       "--audio-format",
-      "mp3",
+      target,
+      // lossless/pcm targets ignore quality; mp3 uses the chosen bitrate,
+      // everything else re-encodes at the best sensible preset (0)
       "--audio-quality",
-      `${bitrate}K`,
+      target === "mp3" ? `${bitrate}K` : "0",
       "-o",
       path.join(jobsDir(), `${jobId}.%(ext)s`),
       input.webpageUrl || raw.webpage_url,

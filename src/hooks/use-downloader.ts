@@ -462,9 +462,15 @@ export function useDownloader() {
 
   const startDownload = useCallback(
     async (fmt: PublicFormat, infoData: PublicInfo, overrideBitrate?: number) => {
-      const isMp3 = fmt.container === "mp3";
-      const label = isMp3
-        ? `MP3 ${overrideBitrate ?? 320}`
+      // audio conversions: mp3/flac/wav always re-encode; m4a/opus only when no
+      // native stream of that container exists (fmt.id === "convert")
+      const isConversion =
+        fmt.kind === "audio" &&
+        (fmt.id === "convert" || ["mp3", "flac", "wav"].includes(fmt.container));
+      const label = isConversion
+        ? fmt.container === "mp3"
+          ? `MP3 ${overrideBitrate ?? 320}`
+          : fmt.container.toUpperCase()
         : fmt.kind === "video"
           ? `${fmt.quality} · ${fmt.container.toUpperCase()}`
           : `${fmt.quality} · ${fmt.container.toUpperCase()}`;
@@ -490,16 +496,17 @@ export function useDownloader() {
       setItems((prev) => [shell, ...prev].slice(0, 12));
 
       try {
-        if (fmt.needsMerge || isMp3) {
-          /* ---------- server job (merge / mp3) ---------- */
+        if (fmt.needsMerge || isConversion) {
+          /* ---------- server job (merge / audio conversion) ---------- */
           const res = await fetch("/api/jobs", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               infoId: infoData.infoId,
-              mode: isMp3 ? "mp3" : "merge",
+              mode: isConversion ? "mp3" : "merge",
               videoFormatId: fmt.needsMerge ? fmt.id : undefined,
-              bitrate: isMp3 ? overrideBitrate ?? 320 : undefined,
+              audioFormat: isConversion ? fmt.container : undefined,
+              bitrate: isConversion ? overrideBitrate ?? 320 : undefined,
               title: infoData.title,
               webpageUrl: infoData.webpageUrl,
             }),

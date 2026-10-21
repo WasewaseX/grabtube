@@ -28,6 +28,7 @@ export async function POST(req: Request) {
     mode?: "merge" | "mp3";
     videoFormatId?: string;
     bitrate?: number;
+    audioFormat?: string;
     title?: string;
     webpageUrl?: string;
     duration?: number;
@@ -69,13 +70,14 @@ function buildInput(
   infoId: string,
   raw: RawInfo,
   mode: "merge" | "mp3",
-  body: { videoFormatId?: string; bitrate?: number; title?: string; webpageUrl?: string; duration?: number },
+  body: { videoFormatId?: string; bitrate?: number; audioFormat?: string; title?: string; webpageUrl?: string; duration?: number },
 ): CreateJobInput {
   const base: CreateJobInput = {
     infoId,
     mode,
     videoFormatId: body.videoFormatId,
     bitrate: body.bitrate,
+    audioFormat: body.audioFormat,
     webpageUrl: body.webpageUrl || raw.webpage_url,
     title: body.title || raw.title,
     duration: body.duration || raw.duration,

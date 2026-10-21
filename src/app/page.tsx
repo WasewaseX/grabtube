@@ -1,11 +1,13 @@
 import { DownloaderApp } from "@/components/app/app";
 
 /**
- * TubeGrab — desktop-style single-window shell (title bar, tab strip,
- * Home / Downloads / History / Settings). Fully client-rendered after the
- * static shell mounts: every dynamic value arrives via client fetches, so
- * server HTML and first client render always match (hydration-safe).
+ * YouWee — YouTube Downloader. Single-window shell (topbar, URL card,
+ * quality tiles / codec chips / audio segments, live job rows, settings +
+ * history overlays). 1:1 port of the original desktop app design. Fully
+ * client-rendered after the static shell mounts: every dynamic value
+ * arrives via client fetches, so server HTML and first client render
+ * always match (hydration-safe).
  */
 export default function Home() {
-  return <DownloaderApp initialLang="en" />;
+  return <DownloaderApp />;
 }

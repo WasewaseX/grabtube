@@ -9,6 +9,7 @@ export const MIME_MAP: Record<string, string> = {
   m4a: "audio/mp4",
   mp3: "audio/mpeg",
   opus: "audio/opus",
+  flac: "audio/flac",
   wav: "audio/wav",
 };
 

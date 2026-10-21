@@ -1,0 +1,790 @@
+     1→/**
+     2→ * yt-dlp engine core: tool discovery, hardened execution, extraction with
+     3→ * anti-bot layers, the shared info store and the public (UI-facing) format
+     4→ * model used by the whole app.
+     5→ *
+     6→ * Anti-bot layers (in order):
+     7→ *   1. egress lane manager (proxy.ts) — Cloudflare WARP consumer tunnel first
+     8→ *   2. player-client rotation (CLIENT_CHAIN)
+     9→ *   3. visitor_data injection (minted through the tunnel, cached, rotated)
+    10→ *   4. bgutil PO-token provider (pot.ts supervised deno server)
+    11→ *   5. remote JS-challenge components (deno) — solves the n-transform
+    12→ *   6. user cookies.txt (Settings) — permanent fix for hard-flagged IPs
+    13→ *   7. community proxy APIs (providers.ts) — Piped/Invidious fleet fallback
+    14→ */
+    15→import { spawn, execFile } from 'child_process'
+    16→import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs'
+    17→import path from 'path'
+    18→import os from 'os'
+    19→import { randomUUID } from 'crypto'
+    20→import { ytDlpProxy } from './proxy'
+    21→
+    22→// ---- Tool discovery --------------------------------------------------------
+    23→
+    24→function firstExisting(candidates: string[]): string | null {
+    25→  for (const c of candidates) {
+    26→    try {
+    27→      if (existsSync(c)) return c
+    28→    } catch {
+    29→      /* ignore */
+    30→    }
+    31→  }
+    32→  return null
+    33→}
+    34→
+    35→const PROJECT_ROOT = '/home/z/my-project'
+    36→
+    37→const YT_DLP_CANDIDATES = [
+    38→  path.join(PROJECT_ROOT, 'tools/venv/bin/yt-dlp'), // project-local (survives home resets)
+    39→  '/home/z/.venv/bin/yt-dlp',
+    40→  '/usr/local/bin/yt-dlp',
+    41→  '/usr/bin/yt-dlp',
+    42→  path.join(os.homedir(), '.venv/bin/yt-dlp'),
+    43→  path.join(os.homedir(), '.local/bin/yt-dlp'),
+    44→]
+    45→
+    46→const FFMPEG_CANDIDATES = ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/home/linuxbrew/.linuxbrew/bin/ffmpeg']
+    47→
+    48→const DENO_CANDIDATES = [
+    49→  path.join(PROJECT_ROOT, 'tools/deno/bin/deno'), // project-local (survives home resets)
+    50→  '/home/z/.deno/bin/deno',
+    51→  path.join(os.homedir(), '.deno/bin/deno'),
+    52→  '/usr/local/bin/deno',
+    53→]
+    54→
+    55→let ytDlpPath: string | null = null
+    56→let ffmpegPath: string | null = null
+    57→let denoPath: string | null = null
+    58→let ffmpegPresent: boolean | null = null
+    59→
+    60→// re-resolve if the cached binary vanished (e.g. sandbox home resets)
+    61→export function getYtDlpPath(): string {
+    62→  if (!ytDlpPath || !existsSync(ytDlpPath)) ytDlpPath = firstExisting(YT_DLP_CANDIDATES) ?? 'yt-dlp'
+    63→  return ytDlpPath
+    64→}
+    65→
+    66→export function getFfmpegPath(): string {
+    67→  if (!ffmpegPath || !existsSync(ffmpegPath)) ffmpegPath = firstExisting(FFMPEG_CANDIDATES) ?? 'ffmpeg'
+    68→  return ffmpegPath
+    69→}
+    70→
+    71→export function hasFfmpeg(): boolean {
+    72→  if (ffmpegPresent === null || !existsSync(getFfmpegPath())) {
+    73→    ffmpegPresent = Boolean(firstExisting(FFMPEG_CANDIDATES))
+    74→  }
+    75→  return ffmpegPresent
+    76→}
+    77→
+    78→export function getDenoPath(): string {
+    79→  if (!denoPath || !existsSync(denoPath)) denoPath = firstExisting(DENO_CANDIDATES) ?? 'deno'
+    80→  return denoPath
+    81→}
+    82→
+    83→export const POT_SERVER_URL = 'http://127.0.0.1:4416'
+    84→
+    85→/** Spawn env that ALWAYS exposes the project-local deno + venv binaries —
+    86→ *  yt-dlp 2026+ needs a JS runtime (EJS) and refuses to work without one. */
+    87→export function toolEnv(): NodeJS.ProcessEnv {
+    88→  const denoDir = path.dirname(path.dirname(getDenoPath())) // …/tools/deno
+    89→  const venvDir = path.dirname(path.dirname(getYtDlpPath())) // …/tools/venv
+    90→  const extra = [path.join(denoDir, 'bin'), path.join(venvDir, 'bin')]
+    91→  return {
+    92→    ...process.env,
+    93→    PATH: `${extra.join(':')}:${process.env.PATH ?? ''}`,
+    94→    SSL_CERT_FILE: process.env.SSL_CERT_FILE ?? '/etc/ssl/certs/ca-certificates.crt',
+    95→  }
+    96→}
+    97→
+    98→// ---- Command execution -----------------------------------------------------
+    99→
+   100→export interface RunResult {
+   101→  code: number
+   102→  stdout: string
+   103→  stderr: string
+   104→}
+   105→
+   106→export function runYtDlp(args: string[], timeoutMs = 120000): Promise<RunResult> {
+   107→  return new Promise((resolve, reject) => {
+   108→    execFile(
+   109→      getYtDlpPath(),
+   110→      args,
+   111→      { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024, env: toolEnv() },
+   112→      (err, stdout, stderr) => {
+   113→        if (err && typeof (err as NodeJS.ErrnoException).code === 'undefined' && !stdout && !stderr) {
+   114→          return reject(err)
+   115→        }
+   116→        resolve({ code: err ? 1 : 0, stdout: stdout ?? '', stderr: stderr ?? '' })
+   117→      }
+   118→    )
+   119→  })
+   120→}
+   121→
+   122→// ---- Errors ----------------------------------------------------------------
+   123→
+   124→export type DlErrorCode =
+   125→  | 'INVALID_URL'
+   126→  | 'PRIVATE'
+   127→  | 'UNAVAILABLE'
+   128→  | 'AGE_RESTRICTED'
+   129→  | 'LIVE'
+   130→  | 'NO_FORMATS'
+   131→  | 'UNSUPPORTED_URL'
+   132→  | 'BOT_CHECK'
+   133→  | 'RATE_LIMITED'
+   134→  | 'GEO_BLOCKED'
+   135→  | 'TIMEOUT'
+   136→  | 'FETCH_FAILED'
+   137→  | 'EXPIRED'
+   138→  | 'NOT_FOUND'
+   139→  | 'NO_FFMPEG'
+   140→  | 'INTERNAL'
+   141→
+   142→export class DlError extends Error {
+   143→  code: DlErrorCode
+   144→  hint?: string
+   145→  constructor(code: DlErrorCode, message: string, hint?: string) {
+   146→    super(message)
+   147→    this.code = code
+   148→    this.hint = hint
+   149→  }
+   150→}
+   151→
+   152→/** Terminal video states — no point rotating clients or trying providers. */
+   153→export const TERMINAL_CODES: ReadonlySet<DlErrorCode> = new Set([
+   154→  'PRIVATE',
+   155→  'UNAVAILABLE',
+   156→  'AGE_RESTRICTED',
+   157→  'LIVE',
+   158→  'UNSUPPORTED_URL',
+   159→  'GEO_BLOCKED',
+   160→  'INVALID_URL',
+   161→])
+   162→
+   163→interface Classified {
+   164→  code: DlErrorCode
+   165→  message: string
+   166→  hint?: string
+   167→}
+   168→
+   169→const RULES: Array<{ code: DlErrorCode; re: RegExp; message: string; hint?: string }> = [
+   170→  {
+   171→    code: 'BOT_CHECK',
+   172→    re: /sign in to confirm|not a bot|page needs to be reloaded|login required/i,
+   173→    message: 'YouTube demanded a bot-check for this egress.',
+   174→  },
+   175→  {
+   176→    code: 'RATE_LIMITED',
+   177→    re: /HTTP Error 429|Too Many Requests|429:/i,
+   178→    message: 'YouTube is rate-limiting this route.',
+   179→  },
+   180→  { code: 'PRIVATE', re: /private video|members-only|join this channel/i, message: 'This video is private.' },
+   181→  {
+   182→    code: 'UNAVAILABLE',
+   183→    re: /video unavailable|removed by the uploader|no longer available/i,
+   184→    message: 'This video is unavailable or was removed.',
+   185→  },
+   186→  {
+   187→    code: 'AGE_RESTRICTED',
+   188→    re: /confirm your age|age.restricted|inappropriate for some users/i,
+   189→    message: 'Age-restricted video — cookies required.',
+   190→  },
+   191→  {
+   192→    code: 'GEO_BLOCKED',
+   193→    re: /not available in your country|geo.?restrict|blocked it in your country/i,
+   194→    message: 'This video is blocked for the server region.',
+   195→  },
+   196→  { code: 'LIVE', re: /live event will begin|is live|premieres in/i, message: 'Live streams cannot be downloaded.' },
+   197→  { code: 'UNSUPPORTED_URL', re: /unsupported url|no video formats found/i, message: 'This URL is not supported.' },
+   198→  { code: 'TIMEOUT', re: /timed out|ETIMEDOUT|timeout/i, message: 'The request timed out.' },
+   199→  {
+   200→    code: 'NO_FORMATS',
+   201→    re: /requested format is not available|only images are available/i,
+   202→    message: 'No downloadable formats found.',
+   203→  },
+   204→]
+   205→
+   206→export function classifyStderr(stderr: string): Classified {
+   207→  for (const r of RULES) {
+   208→    if (r.re.test(stderr)) return { code: r.code, message: r.message, hint: r.hint }
+   209→  }
+   210→  return { code: 'FETCH_FAILED', message: 'Extraction failed.' }
+   211→}
+   212→
+   213→export function detectBotCheck(stderr: string): boolean {
+   214→  return /sign in to confirm|not a bot|page needs to be reloaded|HTTP Error 429|Too Many Requests/i.test(stderr)
+   215→}
+   216→
+   217→// ---- Raw model (yt-dlp JSON / provider adapters share this shape) ----------
+   218→
+   219→export interface YtRawFormat {
+   220→  format_id: string
+   221→  ext?: string
+   222→  url?: string
+   223→  vcodec?: string
+   224→  acodec?: string
+   225→  height?: number
+   226→  width?: number
+   227→  fps?: number
+   228→  tbr?: number
+   229→  abr?: number
+   230→  asr?: number
+   231→  filesize?: number
+   232→  filesize_approx?: number
+   233→  protocol?: string
+   234→  format_note?: string
+   235→  dynamic_range?: string
+   236→  container?: string
+   237→}
+   238→
+   239→export interface RawInfo {
+   240→  id: string
+   241→  title: string
+   242→  uploader?: string
+   243→  channel?: string
+   244→  duration?: number
+   245→  view_count?: number
+   246→  thumbnail?: string
+   247→  webpage_url: string
+   248→  is_live?: boolean
+   249→  live_status?: string
+   250→  extractor_key?: string
+   251→  formats: YtRawFormat[]
+   252→}
+   253→
+   254→// ---- Public model (UI-facing) ----------------------------------------------
+   255→
+   256→export interface PublicFormat {
+   257→  id: string // format id, or composite "videoId|audioId|container" for merges
+   258→  kind: 'video' | 'audio'
+   259→  quality: string
+   260→  container: string
+   261→  vcodec?: string
+   262→  acodec?: string
+   263→  fps?: number
+   264→  filesize?: number
+   265→  approx?: boolean
+   266→  hasAudio?: boolean
+   267→  instant: boolean
+   268→  needsMerge: boolean
+   269→  hdr?: boolean
+   270→  recommended?: boolean
+   271→}
+   272→
+   273→export interface PublicInfo {
+   274→  infoId: string
+   275→  title: string
+   276→  author: string
+   277→  views: number
+   278→  duration: number
+   279→  thumbnail: string
+   280→  webpageUrl: string
+   281→  source: string // "youtube" | "other" | provider label
+   282→  videoFormats: PublicFormat[]
+   283→  audioFormats: PublicFormat[]
+   284→  mp3Options: number[]
+   285→}
+   286→
+   287→// ---- Info store ------------------------------------------------------------
+   288→
+   289→interface StoreEntry {
+   290→  raw: RawInfo
+   291→  at: number
+   292→}
+   293→
+   294→declare global {
+   295→  var __tgInfoStore: Map<string, StoreEntry> | undefined
+   296→}
+   297→
+   298→function infoStore(): Map<string, StoreEntry> {
+   299→  if (!globalThis.__tgInfoStore) globalThis.__tgInfoStore = new Map()
+   300→  return globalThis.__tgInfoStore
+   301→}
+   302→
+   303→const INFO_TTL_MS = 6 * 60 * 60 * 1000
+   304→const INFO_MAX = 60
+   305→
+   306→function pruneStore(): void {
+   307→  const store = infoStore()
+   308→  const now = Date.now()
+   309→  for (const [k, v] of store) {
+   310→    if (now - v.at > INFO_TTL_MS) store.delete(k)
+   311→  }
+   312→  while (store.size > INFO_MAX) {
+   313→    const oldest = [...store.entries()].sort((a, b) => a[1].at - b[1].at)[0]
+   314→    if (!oldest) break
+   315→    store.delete(oldest[0])
+   316→  }
+   317→}
+   318→
+   319→export function putInfo(raw: RawInfo): string {
+   320→  const id = randomUUID()
+   321→  const store = infoStore()
+   322→  store.set(id, { raw, at: Date.now() })
+   323→  pruneStore()
+   324→  return id
+   325→}
+   326→
+   327→export function getInfo(infoId: string): StoreEntry | null {
+   328→  const e = infoStore().get(infoId)
+   329→  if (!e) return null
+   330→  if (Date.now() - e.at > INFO_TTL_MS) {
+   331→    infoStore().delete(infoId)
+   332→    return null
+   333→  }
+   334→  return e
+   335→}
+   336→
+   337→// ---- Cookies ---------------------------------------------------------------
+   338→
+   339→export async function writeCookiesFile(cookies: string): Promise<string | null> {
+   340→  if (!cookies || !cookies.trim()) return null
+   341→  const dir = '/tmp/ytdl-cookies'
+   342→  try {
+   343→    mkdirSync(dir, { recursive: true })
+   344→    const file = path.join(dir, `cookies-${process.pid}.txt`)
+   345→    writeFileSync(file, cookies, { mode: 0o600 })
+   346→    return file
+   347→  } catch {
+   348→    return null
+   349→  }
+   350→}
+   351→
+   352→// ---- Visitor data ----------------------------------------------------------
+   353→
+   354→const DATA_DIR = path.join(PROJECT_ROOT, 'data')
+   355→const VISITOR_FILE = path.join(DATA_DIR, 'visitor_data.txt')
+   356→
+   357→declare global {
+   358→  var __tgVisitorData: string | null | undefined
+   359→  var __tgVisitorAt: number | undefined
+   360→}
+   361→
+   362→const VISITOR_TTL_MS = 4 * 60 * 60 * 1000
+   363→
+   364→function cachedVisitorData(): string | null {
+   365→  if (globalThis.__tgVisitorData && Date.now() - (globalThis.__tgVisitorAt ?? 0) < VISITOR_TTL_MS) {
+   366→    return globalThis.__tgVisitorData
+   367→  }
+   368→  try {
+   369→    if (existsSync(VISITOR_FILE)) {
+   370→      const v = readFileSync(VISITOR_FILE, 'utf8').trim()
+   371→      if (v) {
+   372→        globalThis.__tgVisitorData = v
+   373→        globalThis.__tgVisitorAt = Date.now()
+   374→        return v
+   375→      }
+   376→    }
+   377→  } catch {
+   378→    /* ignore */
+   379→  }
+   380→  return null
+   381→}
+   382→
+   383→function persistVisitorData(v: string): void {
+   384→  globalThis.__tgVisitorData = v
+   385→  globalThis.__tgVisitorAt = Date.now()
+   386→  try {
+   387→    mkdirSync(DATA_DIR, { recursive: true })
+   388→    writeFileSync(VISITOR_FILE, v, 'utf8')
+   389→  } catch {
+   390→    /* ignore */
+   391→  }
+   392→}
+   393→
+   394→/** Mint a fresh visitor_data through the ACTIVE egress lane. */
+   395→async function mintVisitorData(): Promise<string | null> {
+   396→  try {
+   397→    const { proxiedFetch } = await import('./proxy')
+   398→    const res = await proxiedFetch('https://www.youtube.com/', {
+   399→      headers: {
+   400→        'User-Agent':
+   401→          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+   402→        'Accept-Language': 'en-US,en;q=0.9',
+   403→      },
+   404→    })
+   405→    const html = await res.text()
+   406→    const m =
+   407→      html.match(/"visitorData":"((?:[^"\\]|\\.)*)"/) ||
+   408→      html.match(/"VISITOR_DATA":"((?:[^"\\]|\\.)*)"/)
+   409→    if (!m) return null
+   410→    const v = JSON.parse(`"${m[1]}"`) as string
+   411→    return v || null
+   412→  } catch {
+   413→    return null
+   414→  }
+   415→}
+   416→
+   417→async function ensureVisitorData(): Promise<string | null> {
+   418→  const cached = cachedVisitorData()
+   419→  if (cached) return cached
+   420→  const minted = await mintVisitorData()
+   421→  if (minted) persistVisitorData(minted)
+   422→  return minted ?? null
+   423→}
+   424→
+   425→// ---- Player-client chain ---------------------------------------------------
+   426→
+   427→const CLIENT_ORDER = ['mweb', 'tv', 'web_safari', 'web', 'ios']
+   428→
+   429→/** Rotation steps; [0] is used by server-side jobs (jobs.ts) so it must always
+   430→ *  carry the freshest visitor_data. Mutated in place by refreshClientChain. */
+   431→export const CLIENT_CHAIN: string[][] = CLIENT_ORDER.map((c) => [
+   432→  '--extractor-args',
+   433→  `youtube:player_client=${c}`,
+   434→])
+   435→
+   436→export function refreshClientChain(visitorData: string | null): void {
+   437→  for (let i = 0; i < CLIENT_ORDER.length; i++) {
+   438→    const val = visitorData
+   439→      ? `youtube:player_client=${CLIENT_ORDER[i]};visitor_data=${visitorData}`
+   440→      : `youtube:player_client=${CLIENT_ORDER[i]}`
+   441→    CLIENT_CHAIN[i] = ['--extractor-args', val]
+   442→  }
+   443→}
+   444→
+   445→// ---- Base args -------------------------------------------------------------
+   446→
+   447→/** Hardened base args shared by every spawn (analysis, jobs, URL resolving). */
+   448→export function baseArgs(): string[] {
+   449→  const args = [
+   450→    '--socket-timeout', '20',
+   451→    '--retries', '15',
+   452→    '--fragment-retries', '15',
+   453→    '--extractor-retries', '2',
+   454→    '--force-ipv4',
+   455→    '--no-check-certificates',
+   456→    '--no-playlist',
+   457→    // deno-solved JS challenges (n-transform) — without this YouTube omits
+   458→    // every media format and returns "only images are available"
+   459→    '--remote-components', 'ejs:github',
+   460→    '--extractor-args', `youtubepot-bgutilhttp:base_url=${POT_SERVER_URL}`,
+   461→  ]
+   462→  const proxy = ytDlpProxy()
+   463→  if (proxy) args.push('--proxy', proxy)
+   464→  return args
+   465→}
+   466→
+   467→/** Engine descriptor for server-side jobs. */
+   468→export function getEngine(): { cmd: string; baseArgs: string[] } {
+   469→  return { cmd: getYtDlpPath(), baseArgs: baseArgs() }
+   470→}
+   471→
+   472→// ---- Extraction ------------------------------------------------------------
+   473→
+   474→function isYouTubeUrl(url: string): boolean {
+   475→  return /^(https?:\/\/)?(www\.|m\.|music\.)?(youtube\.com|youtu\.be|youtube-nocookie\.com)\//i.test(url.trim())
+   476→}
+   477→
+   478→export function isValidYouTubeUrl(url: string): boolean {
+   479→  return isYouTubeUrl(url)
+   480→}
+   481→
+   482→export function extractVideoId(url: string): string | null {
+   483→  const m =
+   484→    url.match(/[?&]v=([\w-]{11})/) ||
+   485→    url.match(/youtu\.be\/([\w-]{11})/) ||
+   486→    url.match(/shorts\/([\w-]{11})/) ||
+   487→    url.match(/embed\/([\w-]{11})/) ||
+   488→    url.match(/live\/([\w-]{11})/)
+   489→  return m ? m[1] : null
+   490→}
+   491→
+   492→async function parseRaw(stdout: string, url: string): Promise<RawInfo> {
+   493→  const data = JSON.parse(stdout) as Record<string, unknown>
+   494→  const formats = ((data.formats as YtRawFormat[]) ?? []).filter((f) => {
+   495→    if (!f.format_id) return false
+   496→    if ((f.ext ?? '') === 'mhtml') return false
+   497→    if (/storyboard/i.test(f.format_note ?? '')) return false
+   498→    return true
+   499→  })
+   500→  return {
+   501→    id: String(data.id ?? extractVideoId(url) ?? ''),
+   502→    title: String(data.title ?? 'Untitled'),
+   503→    uploader: (data.uploader as string) || (data.channel as string) || undefined,
+   504→    channel: (data.channel as string) || undefined,
+   505→    duration: (data.duration as number) || undefined,
+   506→    view_count: (data.view_count as number) || undefined,
+   507→    thumbnail: (data.thumbnail as string) || undefined,
+   508→    webpage_url: String(data.webpage_url ?? url),
+   509→    is_live: Boolean(data.is_live),
+   510→    live_status: (data.live_status as string) || undefined,
+   511→    extractor_key: String(data.extractor_key ?? data.extractor ?? 'Generic'),
+   512→    formats,
+   513→  }
+   514→}
+   515→
+   516→/**
+   517→ * Full extraction through the current engine stack.
+   518→ * Throws DlError with a classified code; extract.ts decides the fallback.
+   519→ */
+   520→export async function fetchInfo(url: string): Promise<{ infoId: string; raw: RawInfo }> {
+   521→  const clean = url.trim()
+   522→  if (!/^https?:\/\//i.test(clean)) {
+   523→    throw new DlError('INVALID_URL', 'That does not look like a valid video URL.')
+   524→  }
+   525→
+   526→  const { ensurePotServer } = await import('./pot')
+   527→  void ensurePotServer().catch(() => undefined)
+   528→
+   529→  const cookies = await loadCookiesText()
+   530→
+   531→  if (!isYouTubeUrl(clean)) {
+   532→    const { code, stdout, stderr } = await runYtDlp(
+   533→      ['-J', ...baseArgs(), ...(cookies ? ['--cookies', cookies] : []), clean],
+   534→      150000,
+   535→    )
+   536→    if (code !== 0 || !stdout.trim().startsWith('{')) {
+   537→      const c = classifyStderr(stderr)
+   538→      throw new DlError(c.code, c.message, c.hint)
+   539→    }
+   540→    const raw = await parseRaw(stdout, clean)
+   541→    if (raw.is_live) throw new DlError('LIVE', 'Live streams cannot be downloaded.')
+   542→    if (raw.formats.length === 0) throw new DlError('NO_FORMATS', 'No downloadable formats found.')
+   543→    const infoId = putInfo(raw)
+   544→    return { infoId, raw }
+   545→  }
+   546→
+   547→  let visitor = await ensureVisitorData()
+   548→  refreshClientChain(visitor)
+   549→  let rotatedVisitor = false
+   550→  const errors: Classified[] = []
+   551→  const MAX_STEPS = 4
+   552→
+   553→  for (let i = 0; i < Math.min(MAX_STEPS, CLIENT_CHAIN.length); i++) {
+   554→    const step = CLIENT_CHAIN[i]
+   555→    const { code, stdout, stderr } = await runYtDlp(
+   556→      ['-J', ...baseArgs(), ...step, ...(cookies ? ['--cookies', cookies] : []), clean],
+   557→      90000,
+   558→    )
+   559→    if (code === 0 && stdout.trim().startsWith('{')) {
+   560→      const raw = await parseRaw(stdout, clean)
+   561→      if (raw.is_live) throw new DlError('LIVE', 'Live streams cannot be downloaded.')
+   562→      if (raw.formats.length > 0) {
+   563→        const infoId = putInfo(raw)
+   564→        return { infoId, raw }
+   565→      }
+   566→      errors.push({ code: 'NO_FORMATS', message: 'Player returned no media formats.' })
+   567→      continue
+   568→    }
+   569→    const c = classifyStderr(stderr || 'empty output')
+   570→    if (TERMINAL_CODES.has(c.code)) throw new DlError(c.code, c.message, c.hint)
+   571→    errors.push(c)
+   572→    // bot wall → rotate visitor identity exactly once and keep rotating clients
+   573→    if ((c.code === 'BOT_CHECK' || c.code === 'RATE_LIMITED') && !rotatedVisitor) {
+   574→      rotatedVisitor = true
+   575→      const minted = await mintVisitorData()
+   576→      if (minted && minted !== visitor) {
+   577→        visitor = minted
+   578→        persistVisitorData(minted)
+   579→        refreshClientChain(visitor)
+   580→      }
+   581→    }
+   582→  }
+   583→
+   584→  const worst = errors.find((e) => e.code === 'BOT_CHECK') ?? errors[0] ?? { code: 'FETCH_FAILED' as const, message: 'Extraction failed.' }
+   585→  throw new DlError(worst.code, worst.message, worst.hint)
+   586→}
+   587→
+   588→async function loadCookiesText(): Promise<string | null> {
+   589→  try {
+   590→    const { getSettings } = await import('./settings')
+   591→    const s = await getSettings()
+   592→    return s.cookies && s.cookies.trim() ? s.cookies : null
+   593→  } catch {
+   594→    return null
+   595→  }
+   596→}
+   597→
+   598→/** Resolve a FRESH direct media URL for a format selector (IDM re-mints). */
+   599→export async function resolveFormatUrl(webpageUrl: string, selector: string): Promise<string | null> {
+   600→  try {
+   601→    const cookies = await loadCookiesText()
+   602→    const { code, stdout } = await runYtDlp(
+   603→      [
+   604→        ...baseArgs(),
+   605→        ...(cookies ? ['--cookies', cookies] : []),
+   606→        ...CLIENT_CHAIN[0],
+   607→        '-f',
+   608→        selector,
+   609→        '--get-url',
+   610→        webpageUrl,
+   611→      ],
+   612→      90000,
+   613→    )
+   614→    if (code !== 0) return null
+   615→    const line = stdout
+   616→      .split('\n')
+   617→      .map((l) => l.trim())
+   618→      .find((l) => /^https?:\/\//.test(l))
+   619→    return line ?? null
+   620→  } catch {
+   621→    return null
+   622→  }
+   623→}
+   624→
+   625→// ---- Public model mapping --------------------------------------------------
+   626→
+   627→function codecLabel(c?: string): string | undefined {
+   628→  if (!c || c === 'none') return undefined
+   629→  const s = c.toLowerCase()
+   630→  if (s.startsWith('avc1') || s.startsWith('avc3') || s.includes('h264') || s.includes('h.264')) return 'H.264'
+   631→  if (s.startsWith('vp9') || s.includes('vp09')) return 'VP9'
+   632→  if (s.startsWith('vp8')) return 'VP8'
+   633→  if (s.startsWith('av01')) return 'AV1'
+   634→  if (s.startsWith('mp4a') || s.includes('aac')) return 'AAC'
+   635→  if (s.includes('opus')) return 'Opus'
+   636→  if (s.includes('vorbis')) return 'Vorbis'
+   637→  if (s.includes('ec-3') || s.includes('eac3')) return 'E-AC3'
+   638→  if (s.includes('ac-3')) return 'AC3'
+   639→  return c.split('.')[0].toUpperCase()
+   640→}
+   641→
+   642→function fmtSize(f: YtRawFormat): number | undefined {
+   643→  return f.filesize || f.filesize_approx || undefined
+   644→}
+   645→
+   646→function videoQuality(f: YtRawFormat): string {
+   647→  const h = f.height
+   648→  if (!h) return f.format_note || f.format_id
+   649→  const fps = f.fps && f.fps > 30 ? f.fps : 0
+   650→  return `${h}p${fps || ''}`
+   651→}
+   652→
+   653→function audioQuality(f: YtRawFormat): string {
+   654→  const k = Math.round(f.abr || f.tbr || 0)
+   655→  return k > 0 ? `${k}k` : f.format_note || f.format_id
+   656→}
+   657→
+   658→function isStreamable(f: YtRawFormat): boolean {
+   659→  const proto = (f.protocol ?? '').toLowerCase()
+   660→  return proto === 'https' || proto === 'http' || proto === ''
+   661→}
+   662→
+   663→function pickAudio(formats: YtRawFormat[], container: string): YtRawFormat | null {
+   664→  const audios = formats.filter((f) => f.vcodec === 'none' && f.acodec && f.acodec !== 'none')
+   665→  if (audios.length === 0) return null
+   666→  const family = /webm|mkv/.test(container) ? ['opus', 'vorbis'] : ['mp4a', 'aac']
+   667→  const scored = audios
+   668→    .map((f) => {
+   669→      const s = (f.acodec ?? '').toLowerCase()
+   670→      const fam = family.some((x) => s.includes(x)) ? 1 : 0
+   671→      return { f, score: fam * 1000 + (f.abr ?? f.tbr ?? 0) }
+   672→    })
+   673→    .sort((a, b) => b.score - a.score)
+   674→  return scored[0].f
+   675→}
+   676→
+   677→export function toPublicInfo(infoId: string, raw: RawInfo): PublicInfo {
+   678→  const isYT = /youtube/i.test(raw.extractor_key ?? '') || isYouTubeUrl(raw.webpage_url)
+   679→  const source = /:piped/i.test(raw.extractor_key ?? '')
+   680→    ? 'Piped'
+   681→    : /:invidious/i.test(raw.extractor_key ?? '')
+   682→      ? 'Invidious'
+   683→      : isYT
+   684→        ? 'youtube'
+   685→        : 'other'
+   686→
+   687→  const thumbProxy = (u?: string): string => {
+   688→    if (!u || !/^https?:\/\//.test(u)) return ''
+   689→    return `/api/thumb?url=${encodeURIComponent(u)}`
+   690→  }
+   691→
+   692→  const instant: PublicFormat[] = []
+   693→  const videoOnly: Array<{ f: YtRawFormat; fmt: PublicFormat }> = []
+   694→  const audio: PublicFormat[] = []
+   695→
+   696→  for (const f of raw.formats) {
+   697→    const hasV = f.vcodec && f.vcodec !== 'none'
+   698→    const hasA = f.acodec && f.acodec !== 'none'
+   699→    const ext = (f.ext ?? 'mp4').toLowerCase()
+   700→    const size = fmtSize(f)
+   701→
+   702→    if (hasV && hasA) {
+   703→      // muxed — instant single-stream
+   704→      if (!isStreamable(f)) continue
+   705→      instant.push({
+   706→        id: f.format_id,
+   707→        kind: 'video',
+   708→        quality: videoQuality(f),
+   709→        container: ext === 'webm' ? 'webm' : 'mp4',
+   710→        vcodec: codecLabel(f.vcodec),
+   711→        acodec: codecLabel(f.acodec),
+   712→        fps: f.fps,
+   713→        filesize: size,
+   714→        approx: !f.filesize,
+   715→        hasAudio: true,
+   716→        instant: true,
+   717→        needsMerge: false,
+   718→        hdr: /hdr/i.test(f.dynamic_range ?? ''),
+   719→        recommended: true,
+   720→      })
+   721→    } else if (hasV) {
+   722→      const container = ext === 'webm' ? 'webm' : 'mp4'
+   723→      const fmt: PublicFormat = {
+   724→        id: f.format_id, // replaced by composite below
+   725→        kind: 'video',
+   726→        quality: videoQuality(f),
+   727→        container,
+   728→        vcodec: codecLabel(f.vcodec),
+   729→        fps: f.fps,
+   730→        filesize: size,
+   731→        approx: !f.filesize,
+   732→        hasAudio: false,
+   733→        instant: false,
+   734→        needsMerge: true,
+   735→        hdr: /hdr/i.test(f.dynamic_range ?? ''),
+   736→      }
+   737→      videoOnly.push({ f, fmt })
+   738→    } else if (hasA) {
+   739→      if (!isStreamable(f)) continue
+   740→      audio.push({
+   741→        id: f.format_id,
+   742→        kind: 'audio',
+   743→        quality: audioQuality(f),
+   744→        container: ext === 'webm' ? 'webm' : ext === 'm4a' ? 'm4a' : ext,
+   745→        acodec: codecLabel(f.acodec),
+   746→        filesize: size,
+   747→        approx: !f.filesize,
+   748→        hasAudio: true,
+   749→        instant: true,
+   750→        needsMerge: false,
+   751→      })
+   752→    }
+   753→  }
+   754→
+   755→  // composite merges: pair each video-only track with its best audio partner
+   756→  const composites: PublicFormat[] = videoOnly.map(({ f, fmt }) => {
+   757→    const a = pickAudio(raw.formats, fmt.container)
+   758→    const id = a ? `${f.format_id}|${a.format_id}|${fmt.container}` : f.format_id
+   759→    const total = (fmt.filesize ?? 0) + (a ? fmtSize(a) ?? 0 : 0)
+   760→    return {
+   761→      ...fmt,
+   762→      id,
+   763→      filesize: total > 0 ? total : fmt.filesize,
+   764→      approx: !f.filesize || !a?.filesize,
+   765→    }
+   766→  })
+   767→
+   768→  const rankVideo = (f: PublicFormat): number => {
+   769→    const h = parseInt(f.quality, 10) || 0
+   770→    return h * 100 + (f.fps ?? 0) * 2 + (f.container === 'mp4' ? 1 : 0)
+   771→  }
+   772→  instant.sort((a, b) => rankVideo(b) - rankVideo(a))
+   773→  composites.sort((a, b) => rankVideo(b) - rankVideo(a))
+   774→  audio.sort((a, b) => (parseInt(b.quality, 10) || 0) - (parseInt(a.quality, 10) || 0))
+   775→
+   776→  return {
+   777→    infoId,
+   778→    title: raw.title,
+   779→    author: raw.uploader || raw.channel || '',
+   780→    views: raw.view_count ?? 0,
+   781→    duration: raw.duration ?? 0,
+   782→    thumbnail: thumbProxy(raw.thumbnail),
+   783→    webpageUrl: raw.webpage_url,
+   784→    source,
+   785→    videoFormats: [...composites, ...instant],
+   786→    audioFormats: audio,
+   787→    mp3Options: hasFfmpeg() ? [320, 192, 128] : [],
+   788→  }
+   789→}
+   790→

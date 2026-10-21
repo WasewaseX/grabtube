@@ -457,6 +457,13 @@ export function baseArgs(): string[] {
     // deno-solved JS challenges (n-transform) — without this YouTube omits
     // every media format and returns "only images are available"
     '--remote-components', 'ejs:github',
+    // PO tokens: script-deno provider spawns `deno run generate_once.ts` directly.
+    // The HTTP provider is ALSO registered: when the global --proxy lane is a
+    // SOCKS tunnel, its localhost /ping request blackholes inside yt-dlp's
+    // networking (per-request proxy bypass is ignored), so the script mode —
+    // which needs no HTTP at all — is the reliable path to full-quality formats.
+    '--extractor-args',
+    `youtubepot-bgutilscript:server_home=${path.join(PROJECT_ROOT, 'mini-services/pot-provider/server')}`,
     '--extractor-args', `youtubepot-bgutilhttp:base_url=${POT_SERVER_URL}`,
   ]
   const proxy = ytDlpProxy()

@@ -1,55 +1,60 @@
-# GrabTube
+# TubeGrab
 
-**Fast, resumable YouTube downloader for the web.** Every quality and codec, audio-only extraction, IDM-compatible direct links, and a multi-layer anti-bot engine built for hostile networks.
+**Fast, resumable YouTube downloader for the web — engineered for hostile networks.** Every quality and codec up to 4K60, audio-only extraction, IDM-compatible permanent direct links, and an automatic multi-layer anti-bot engine that defeats the *"Sign in to confirm you're not a bot"* wall without any manual setup.
 
 ![stack](https://img.shields.io/badge/Next.js%2016-App%20Router-black) ![ts](https://img.shields.io/badge/TypeScript-strict-blue) ![license](https://img.shields.io/badge/license-MIT-green)
 
-## Why GrabTube
+## Why TubeGrab
 
-Most web downloaders die on three things: verification walls, mid-download failures on slow connections, and links that external download managers cannot touch. GrabTube is engineered against all three:
+Most web downloaders die on three things: verification walls, mid-download failures on slow connections, and links that external download managers cannot touch. TubeGrab is engineered against all three:
 
-| Problem | GrabTube answer |
+| Problem | TubeGrab answer |
 | --- | --- |
-| *"Sign in to confirm you're not a bot"* | Multi-layer engine: bgutil PO-token provider (self-healing deno service), player-client failover chain, proxy rotation with health quarantine, and cookie support |
-| Mid-download failures / slow networks | yt-dlp with 20 retries, 20 fragment retries, linear backoff, parallel fragments, `--continue` resume; failed jobs restart with one click and keep partial files |
-| IDM / aria2 / wget compatibility | Direct links served with `Accept-Ranges`, HTTP `206 Partial Content`, byte-exact `Content-Range`, UTF-8 `Content-Disposition` — multi-threaded resumable downloads verified by SHA-256 |
+| *"Sign in to confirm you're not a bot"* | **Automatic 7-layer bypass**: ① Cloudflare WARP egress tunnel (consumer-grade IP defeats datacenter bot-walls) ② player-client rotation ③ visitor-data minting/rotation ④ bgutil PO-token provider (self-healing deno service) ⑤ remote JS-challenge solver (deno, solves the n-transform) ⑥ optional cookies.txt ⑦ Piped + Invidious community-proxy fleet fallback |
+| Mid-download failures / slow networks | Browser-side auto-resume (up to 15 Range continuations into the same file), server-side bounded-window streaming with backpressure and mid-stream URL re-minting |
+| IDM / aria2 / wget compatibility | `/api/dl` **permanent self-contained direct links** that survive restarts — `Accept-Ranges`, HTTP `206 Partial Content`, byte-exact `Content-Range`, UTF-8 `Content-Disposition`, fresh URL re-minting per hit |
 
 ## Features
 
+- Desktop-style shell (macOS title bar, tab navigation) with **English + Persian (RTL)** UI
 - Analyze any YouTube URL (watch / youtu.be / shorts / embed / live)
-- Video: 8K → 360p, codecs **H.264 / VP9 / AV1** (availability detected per video), containers MP4 / WebM / MKV
-- Audio-only: **M4A, MP3, Opus, FLAC, WAV** (ffmpeg conversion server-side)
-- Live progress: percentage, speed, ETA, pipeline stage (resolving → downloading → merging → converting)
-- Job history with retry / cancel / delete; interrupted jobs are detected after restarts
-- Settings: cookies, proxy rotation list, client order, parallel fragments, retry rounds, PO-token toggle
-- Health dashboard in the header: yt-dlp, ffmpeg, deno, PO-token provider status
+- Video: 144p → **2160p60**, codecs **H.264 / VP9 / AV1** with per-video availability and exact size estimates
+- Audio-only: M4A / Opus direct, **MP3 320/192/128** server-side conversion
+- Live per-item progress: percentage, speed, ETA, merge/convert phases; queue with cancel/remove
+- **Egress lane dashboard**: live WARP tunnel health, latency, egress IP, user proxies, direct fallback
+- Permanent direct links for download managers (copy button on every format row)
+- Thumbnail proxying (works in regions where ytimg CDN is blocked)
 - Hydration-safe, responsive, dark UI (Next.js 16 App Router, shadcn/ui, Tailwind 4)
 
 ## Architecture
 
 ```
-Browser ── Next.js App Router
-             ├─ POST /api/analyze     → yt-dlp -J with strategy matrix
-             ├─ POST /api/download    → job queue (SQLite via Prisma)
-             ├─ GET  /api/jobs[/id]   → progress polling, cancel/retry
-             ├─ GET  /api/file/[id]   → resumable file server (IDM-ready)
-             ├─ GET  /api/settings    → cookies/proxies/options
-             ├─ GET  /api/health      → toolchain status
-             └─ POST /api/stress      → internal stress-test harness
+Browser ── Next.js App Router (port 3000)
+             ├─ POST /api/info         → extract(): yt-dlp → Piped/Invidious fallback
+             ├─ GET  /api/download     → instant single-format proxy stream (Range/206)
+             ├─ POST /api/jobs         → merge / MP3 conversion jobs (in-memory queue)
+             ├─ GET  /api/jobs/[id]    → progress polling
+             ├─ GET  /api/jobs/[id]/file → resumable job file server
+             ├─ GET  /api/dl           → PERMANENT IDM/aria2 direct links (re-minting)
+             ├─ GET  /api/thumb        → SSRF-guarded thumbnail proxy
+             ├─ GET  /api/settings     → cookies + extra proxies + live lanes
+             └─ GET  /api/health       → toolchain + lane dashboard
                        │
-             ┌─────────┴──────────┐
-        yt-dlp engine        deno PO-token provider (port 4416)
-        (retry, resume,      bgutil-ytdlp-pot-provider, supervised
-         strategy rotation)  and auto-revived by the Next.js process
-                       │
-                  ffmpeg (merges, audio conversion, metadata)
+        ┌──────────────┼───────────────────────────┐
+   egress lane manager      yt-dlp engine          mini-services
+   (src/lib/proxy.ts)       (client rotation,      ├─ warp-proxy: wireproxy
+   WARP socks5/http →       visitor-data, PO-      │  (userspace WireGuard)
+   user proxies → direct    tokens, remote EJS)    └─ pot-provider: bgutil
+                                                    PO-token deno server :4416
 ```
 
-The download engine (`src/lib/engine.ts`) rotates `(player client × proxy)` strategies with exponential backoff, quarantines proxies that trigger bot checks, writes throttled progress to SQLite, and recovers interrupted jobs on boot.
+**Extraction chain** (`src/lib/extract.ts`): yt-dlp through the active egress lane → on bot-wall/rate-limit, re-probe lanes and retry → still blocked → race the Piped/Invidious fleet (community proxy APIs return proxied stream URLs that work from any IP).
+
+**Media streaming** (`src/lib/media-stream.ts`): bounded ranged windows (4 MiB), true backpressure (the client socket governs the pace), byte-exact re-rolls of short reads, mid-stream URL re-minting — slow clients can never blow up server memory.
 
 ## Quickstart
 
-Requirements: Node/Bun runtime, Python 3 with pip, ffmpeg, deno.
+Requirements: Bun (or Node), Python 3 with pip, ffmpeg, deno.
 
 ```bash
 # 1. install project dependencies
@@ -58,50 +63,36 @@ bun install            # or: npm install
 # 2. install external toolchain (yt-dlp, deno, PO-token provider; checks ffmpeg)
 ./scripts/setup-tools.sh
 
-# 3. database
+# 3. push the database schema (settings persistence)
 bun run db:push
 
-# 4. run
+# 4. start the WARP tunnel (auto-rotates WireGuard endpoints on failure)
+cd mini-services/warp-proxy && bun run index.ts &
+
+# 5. start the app
 bun run dev            # http://localhost:3000
 ```
 
-### YouTube cookies (recommended)
+The WARP tunnel needs outbound UDP. On networks that throttle one endpoint, the supervisor rotates through 12 official WARP ports automatically. If the tunnel is unavailable the app degrades gracefully: user proxies (Settings) → direct egress → community proxy providers.
 
-Datacenter IPs are heavily flagged by YouTube; cookies are the most reliable bypass:
+## Cookies (optional, permanent fix)
 
-1. Install a browser extension like **Get cookies.txt LOCALLY**
-2. Log in to YouTube (a throwaway account is recommended)
-3. Export `cookies.txt` (Netscape format)
-4. In GrabTube: **Settings → YouTube cookies** → paste the full file contents → Save
+For hard-flagged networks or age-restricted videos, paste a cookies.txt (Netscape format, exported from a signed-in YouTube session) in **Settings → Network resilience**. Cookies are used by every extraction and job automatically.
 
-The badge switches to `ACTIVE`; every analyze/download now carries your cookies. Add residential proxies in the same dialog for a second layer.
+## Direct links for download managers
 
-### Downloading with IDM / aria2 / wget
+Every format row has a chain-link button that copies a permanent URL:
 
-When a job completes, press **Direct link** to copy a stable URL, then:
-
-```bash
-idm /a /d <link>             # IDM
-aria2c -x16 -s16 -c <link>   # aria2, 16 connections, resume
-wget -c <link>               # wget resume
+```
+/api/dl?u=<base64url video>&f=<format>&q=<quality>&t=<title>&b=<bitrate>
 ```
 
-Links support byte-range resume; interrupted transfers continue from where they stopped.
-
-## Configuration
-
-Environment (see `.env.example`):
-
-| Variable | Purpose |
-| --- | --- |
-| `DATABASE_URL` | SQLite file location |
-
-Runtime settings (stored in DB, edited in-app): cookies, proxy list, player-client order, parallel fragments (1–16), retry rounds (1–6), PO-token provider toggle.
+The link re-resolves everything it needs on every hit (cached briefly so an IDM multi-segment swarm shares one minted URL), works hours later and across server restarts, and honors Range/206 for pause/resume.
 
 ## Legal
 
-This project is a self-hosted technical tool. Respect YouTube's Terms of Service and applicable copyright law: download only content you own, that is licensed permissively (e.g. CC), or that you have permission to save. Redistribution of copyrighted material remains your responsibility. The authors take no position on third-party platform policy changes; features may stop working if platforms change.
+This project is a technical tool. Download only content you have the right to save; respect creators and YouTube's Terms of Service.
 
 ## License
 
-[MIT](LICENSE)
+MIT

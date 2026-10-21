@@ -1,7 +1,7 @@
 {
   "name": "grabtube",
-  "version": "1.0.0",
-  "description": "Fast, resumable YouTube downloader web app — yt-dlp + ffmpeg + PO-token anti-bot layers, IDM-compatible direct links",
+  "version": "2.0.0",
+  "description": "TubeGrab \u2014 fast, resumable YouTube downloader web app: WARP egress tunnel + PO-tokens + Piped/Invidious fallbacks, IDM-compatible permanent direct links, EN/FA RTL UI",
   "license": "MIT",
   "author": "WasewaseX",
   "repository": {
@@ -81,6 +81,7 @@
     "sonner": "^2.0.6",
     "tailwind-merge": "^3.3.1",
     "tailwindcss-animate": "^1.0.7",
+    "undici": "^8.12.3",
     "uuid": "^11.1.0",
     "vaul": "^1.1.2",
     "z-ai-web-dev-sdk": "^0.0.18",

@@ -62,3 +62,14 @@ next-env.d.ts
 *_token*
 *.pem
 *.key
+
+# egress lane / runtime state (cookies, visitor data, WARP private keys)
+/data/
+
+# warp-proxy: vendored binaries + private WireGuard profile + logs
+/mini-services/warp-proxy/wgcf
+/mini-services/warp-proxy/wireproxy
+/mini-services/warp-proxy/warp.conf
+/mini-services/warp-proxy/wgcf-account.toml*
+/mini-services/warp-proxy/wgcf-profile.conf
+/mini-services/warp-proxy/warp.log

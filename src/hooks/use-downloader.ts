@@ -210,6 +210,10 @@ export function useDownloader() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ url: clean }),
+          // client-side bail-out: never depend on the gateway's timeout —
+          // the server's own extraction budget (~3 min worst case) fits
+          // inside this, so a real answer usually arrives first
+          signal: AbortSignal.timeout(170_000),
         });
         const json = await res.json();
         if (!res.ok || json.error) {
@@ -220,10 +224,15 @@ export function useDownloader() {
         }
         setInfo(json.info as PublicInfo);
         setPhase("ready");
-      } catch {
+      } catch (e) {
         setPhase("error");
         setErrorCode("FETCH_FAILED");
-        setErrorMsg("Network error");
+        const aborted = e instanceof DOMException && e.name === "TimeoutError";
+        setErrorMsg(
+          aborted
+            ? "The engine took too long — the tunnel is congested. Try again in a minute."
+            : "Network error",
+        );
       }
     },
     [],

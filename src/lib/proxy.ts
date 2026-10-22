@@ -29,6 +29,19 @@ export const COOKIES_PATH = `${DATA_DIR}/cookies.txt`;
 const WARP_SOCKS = "socks5h://127.0.0.1:41080";
 const WARP_HTTP = "http://127.0.0.1:41081";
 const TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace";
+/** Probe candidates: a tunnel that answers ANY of these is alive.
+ *  www.cloudflare.com trace intermittently stalls THROUGH WARP egress
+ *  (Cloudflare-to-Cloudflare hairpin quirk) — without fallbacks the lane
+ *  manager used to flap warp→direct on every blip, and direct gets
+ *  bot-walled, which surfaced to users as random "it ran into errors". */
+const PROBE_URLS = [
+  "https://www.cloudflare.com/cdn-cgi/trace",
+  "https://one.one.one.one/cdn-cgi/trace",
+  "https://api.ipify.org/?format=text",
+];
+/** consecutive failed probe ROUNDS before a lane is declared unhealthy —
+ *  one missed round on a lossy tunnel must NOT flip the active lane */
+const LANE_FAIL_STREAK = 3;
 
 /* ------------------------------------------------------------------ */
 /* Settings persistence (written by /api/settings)                      */
@@ -176,11 +189,11 @@ export function reloadLanes(): void {
 /* Probing                                                             */
 /* ------------------------------------------------------------------ */
 
-function curlThroughProxy(proxy: string): Promise<{ ok: boolean; body: string; ms: number }> {
+function curlThroughProxy(proxy: string, url = TRACE_URL): Promise<{ ok: boolean; body: string; ms: number }> {
   return new Promise((resolve) => {
     const t0 = Date.now();
     try {
-      const proc = spawn("curl", ["-s", "-m", "9", "--proxy", proxy, TRACE_URL], {
+      const proc = spawn("curl", ["-s", "-m", "9", "--proxy", proxy, url], {
         stdio: ["ignore", "pipe", "ignore"],
       });
       let out = "";
@@ -210,37 +223,51 @@ async function probeLane(lane: Lane): Promise<void> {
   const t0 = Date.now();
   try {
     let body = "";
-    if (lane.ytdlpProxy) {
-      // curl speaks HTTP CONNECT and SOCKS natively and is immune to runtime
-      // bundling quirks — the single source of truth for lane health
-      const r = await curlThroughProxy(lane.ytdlpProxy);
-      body = r.body;
-    } else {
-      const res = await fetch(TRACE_URL, {
-        headers: { "User-Agent": "TubeGrab/2.1 health" },
-        signal: AbortSignal.timeout(10_000),
-      });
-      body = await res.text();
+    // try each probe URL until one answers — ANY success keeps the lane alive
+    for (const url of PROBE_URLS) {
+      try {
+        if (lane.ytdlpProxy) {
+          // curl speaks HTTP CONNECT and SOCKS natively and is immune to
+          // runtime bundling quirks — the source of truth for lane health
+          const r = await curlThroughProxy(lane.ytdlpProxy, url);
+          if (r.ok) {
+            body = r.body;
+            break;
+          }
+        } else {
+          const res = await fetch(url, {
+            headers: { "User-Agent": "TubeGrab/2.1 health" },
+            signal: AbortSignal.timeout(10_000),
+          });
+          const text = await res.text();
+          if (res.ok && /ip=|\d+\.\d+\.\d+\.\d+/.test(text)) {
+            body = text;
+            break;
+          }
+        }
+      } catch {
+        /* try the next probe URL */
+      }
     }
-    const ip = body.match(/ip=([^\s]+)/)?.[1] ?? null;
-    const ok = body.includes("ip=");
+    const ip = body.match(/ip=([^\s]+)/)?.[1] ?? body.match(/(\d+\.\d+\.\d+\.\d+)/)?.[1] ?? null;
     lane.lastCheck = Date.now();
     lane.latencyMs = Date.now() - t0;
-    lane.egressIp = ip;
-    if (ok) {
+    if (ip) {
+      lane.egressIp = ip;
       lane.healthy = true;
       lane.failStreak = 0;
       lane.note = undefined;
     } else {
       lane.failStreak++;
-      lane.healthy = false;
-      lane.note = "probe returned no IP";
+      // tolerate transient blips: only go unhealthy after N straight misses
+      lane.healthy = lane.failStreak < LANE_FAIL_STREAK && lane.healthy;
+      lane.note = `probe returned no IP (${lane.failStreak}/${LANE_FAIL_STREAK})`;
     }
   } catch (e) {
     lane.lastCheck = Date.now();
     lane.latencyMs = Date.now() - t0;
-    lane.healthy = false;
     lane.failStreak++;
+    lane.healthy = lane.failStreak < LANE_FAIL_STREAK && lane.healthy;
     const err = e as Error & { cause?: unknown };
     const cause = err?.cause ? String(err.cause).slice(0, 90) : "";
     lane.note = `${String(e).slice(0, 60)}${cause ? ` ← ${cause}` : ""}`;
@@ -363,13 +390,40 @@ declare global {
 function ensureWarpService(): void {
   if (globalThis.__tgWarpSupervisorStarted) return;
   globalThis.__tgWarpSupervisorStarted = true;
+  let spawnedInFlight = false;
   const check = async () => {
-    try {
-      const lane = state().lanes.find((l) => l.id === "warp");
-      if (lane?.healthy) return; // tunnel alive, nothing to do
-    } catch {
-      /* ignore */
-    }
+    // precise liveness test: is anything ANSWERING on the wireproxy socks port?
+    // (lane.healthy flaps — a passing probe from a since-died process used to
+    // make the supervisor skip a needed respawn for minutes)
+    const alive = await Promise.race([
+      import("net")
+        .then(
+          ({ default: net }) =>
+            new Promise<boolean>((resolve) => {
+              try {
+                const sock = net.connect({ host: "127.0.0.1", port: 41080, timeout: 2500 });
+                sock.once("connect", () => {
+                  sock.destroy();
+                  resolve(true);
+                });
+                sock.once("timeout", () => {
+                  sock.destroy();
+                  resolve(false);
+                });
+                sock.once("error", () => resolve(false));
+              } catch {
+                resolve(false);
+              }
+            }),
+        )
+        .catch(() => false as const),
+      new Promise<boolean>((r) => setTimeout(() => r(false), 4000)),
+    ]);
+    if (alive) return; // tunnel socket up, nothing to do
+    // avoid pile-ups while a freshly spawned service is still booting
+    if (spawnedInFlight) return;
+    spawnedInFlight = true;
+    setTimeout(() => (spawnedInFlight = false), 20_000);
     try {
       const probe = await fetch("https://www.cloudflare.com/cdn-cgi/trace", {
         signal: AbortSignal.timeout(4000),
@@ -398,7 +452,7 @@ function ensureWarpService(): void {
     }
   };
   setTimeout(() => void check(), 6000);
-  setInterval(() => void check(), 3 * 60_000);
+  setInterval(() => void check(), 60_000);
 }
 
 if (!globalThis.__tgProxyBooted) {

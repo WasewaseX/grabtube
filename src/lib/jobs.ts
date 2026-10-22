@@ -25,7 +25,7 @@
  */
 import { spawn, type ChildProcess } from "child_process";
 import { randomUUID } from "crypto";
-import { existsSync, mkdirSync, statSync, rmSync, statfsSync } from "fs";
+import { existsSync, mkdirSync, statSync, rmSync, statfsSync, renameSync, copyFileSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
 
@@ -38,7 +38,7 @@ import {
   CLIENT_CHAIN,
   toolEnv,
 } from "./ytdlp";
-import { ffmpegProxyEnv } from "./proxy";
+import { ffmpegProxyEnv, probeAll } from "./proxy";
 import { registerStoredFile } from "./store";
 
 export type JobState = "queued" | "downloading" | "merging" | "ready" | "error" | "cancelled";
@@ -75,6 +75,16 @@ export interface Job {
   formatSpec?: string;
   /** set once the finished file is registered in the store → /api/file/<token> */
   directToken?: string;
+  /** transient-failure auto-retries used (self-healing, like real download
+   *  managers: tunnel stalls / bot blips re-queue instead of dying) */
+  retries?: number;
+  /** args of the last spawn — kept so a retry can re-queue identically
+   *  (yt-dlp then RESUMES the .part file instead of restarting) */
+  lastArgs?: string[];
+  /** last time the transfer made byte progress — the stall watchdog kills
+   *  wedged processes (frozen sockets that never time out) so the retry
+   *  resumes from the .part file */
+  lastProgressAt?: number;
 }
 
 declare global {
@@ -93,6 +103,22 @@ const MAX_CONCURRENT_JOBS = 2;
 const JOBS_TTL_MS = 6 * 60 * 60 * 1000;
 /** a file served within this window is considered actively downloading */
 const ACTIVE_SERVE_MS = 10 * 60 * 1000;
+/** auto-retries for TRANSIENT failures (tunnel stall, bot-check blip, 5xx).
+ *  Terminal errors (private/unavailable/age….) never retry. */
+const MAX_JOB_RETRIES = 3;
+const TERMINAL_JOB_CODES = new Set([
+  "PRIVATE",
+  "UNAVAILABLE",
+  "LIVE",
+  "AGE_RESTRICTED",
+  "UNSUPPORTED_URL",
+  "INVALID_URL",
+  "EXPIRED",
+  "DISK_FULL",
+  "NO_FORMATS",
+  "GEO_BLOCKED",
+  "CANCELLED",
+]);
 
 export function jobsDir(): string {
   const dir = path.join(tmpdir(), "tubegrab-jobs");
@@ -141,6 +167,48 @@ export function ensureCleanupTimer(): void {
   globalThis.__tgJobsCleanup.unref();
 }
 
+/* ---------------- stall watchdog ---------------- */
+
+/**
+ * WEDGE KILLER — the one failure mode yt-dlp cannot self-heal: through a
+ * lossy tunnel a fragment socket occasionally freezes in a read that never
+ * trips the socket timeout (data trickles byte-wise). The process then sits
+ * "downloading" forever with a frozen .part file. Real download managers
+ * solve this with a stall watchdog: no byte progress for N minutes → kill
+ * the process → the close handler re-queues the job (transient) and the
+ * retry RESUMES from the .part file. Bytes already fetched are never lost.
+ */
+const STALL_KILL_MS = 4 * 60 * 1000; // no byte movement for 4 min → wedge
+const HARD_CAP_MS = 60 * 60 * 1000; // 1h without finishing → re-queue
+
+function ensureStallWatchdog(): void {
+  if (globalThis.__tgJobsWatchdog) return;
+  globalThis.__tgJobsWatchdog = setInterval(() => {
+    const now = Date.now();
+    for (const job of jobStore().values()) {
+      if (job.state !== "downloading" && job.state !== "merging") continue;
+      const started = job.lastProgressAt ?? job.createdAt;
+      const stalled = now - started > STALL_KILL_MS && (job.progress > 0 || job.receivedBytes > 0);
+      const overCap = now - started > HARD_CAP_MS;
+      if (!stalled && !overCap) continue;
+      console.log(
+        `[jobs] job ${job.id} watchdog: ${stalled ? "stalled" : "over cap"} — killing for resume-retry`,
+      );
+      job.lastProgressAt = now; // avoid double-fire while the close event lands
+      try {
+        job.proc?.kill("SIGKILL");
+      } catch {
+        /* noop */
+      }
+    }
+  }, 30_000);
+  globalThis.__tgJobsWatchdog.unref();
+}
+
+declare global {
+  var __tgJobsWatchdog: NodeJS.Timeout | undefined;
+}
+
 /* ---------------- concurrency pump ---------------- */
 function activeCount(): number {
   let active = 0;
@@ -167,6 +235,8 @@ function pump(): void {
 
 function spawnYtdlpJob(job: Job, args: string[]): void {
   const engine = getEngine();
+  job.lastArgs = args;
+  job.lastProgressAt = Date.now();
   const proc = spawn(engine.cmd, [...engine.baseArgs, ...args], {
     stdio: ["ignore", "pipe", "pipe"],
     // deno (JS-challenge solver) + venv binaries must be on PATH or YouTube
@@ -180,6 +250,8 @@ function spawnYtdlpJob(job: Job, args: string[]): void {
 }
 
 function spawnFfmpegJob(job: Job, args: string[]): void {
+  job.lastArgs = args;
+  job.lastProgressAt = Date.now();
   const proc = spawn("ffmpeg", ["-hide_banner", "-loglevel", "error", ...args], {
     stdio: ["ignore", "pipe", "pipe"],
     // tunnel ffmpeg's https inputs through the active egress lane
@@ -437,6 +509,7 @@ export function createJob(input: CreateJobInput): Job {
 
   jobStore().set(fullJob.id, fullJob);
   ensureCleanupTimer();
+  ensureStallWatchdog();
   fullJob.args = args;
   pump();
 
@@ -448,9 +521,48 @@ export function createJob(input: CreateJobInput): Job {
  * (async, non-blocking). Once registered, /api/file/<token> serves the LOCAL
  * file forever (until eviction) — that token is pinned onto the job so poll
  * clients pick it up.
+ *
+ * The finished file is FIRST moved out of /tmp (tmp cleaners would break
+ * every stored link at once) into the durable downloads/ directory — the
+ * "database" the direct links point at. Only then is it registered.
  */
+function persistentDownloadsPath(filename: string): string {
+  const dir = "/home/z/my-project/downloads";
+  try {
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  } catch {
+    return path.join(jobsDir(), filename); // fall back to the tmp location
+  }
+  let target = path.join(dir, filename);
+  const ext = path.extname(filename);
+  const base = filename.slice(0, filename.length - ext.length);
+  for (let i = 2; existsSync(target); i++) {
+    target = path.join(dir, `${base} (${i})${ext}`);
+  }
+  return target;
+}
+
+function moveIntoDownloads(job: Job): void {
+  if (!job.filePath || !existsSync(job.filePath)) return;
+  const target = persistentDownloadsPath(job.filename);
+  if (target === job.filePath) return;
+  try {
+    try {
+      renameSync(job.filePath, target); // fast path: same filesystem
+    } catch {
+      // cross-device (different mount) → copy + delete
+      copyFileSync(job.filePath, target);
+      rmSync(job.filePath, { force: true });
+    }
+    job.filePath = target;
+  } catch {
+    /* move failed — register the tmp file anyway; self-heal re-fetches */
+  }
+}
+
 function registerFinishedFile(job: Job): void {
   if (!job.dlKey || !job.filePath) return;
+  moveIntoDownloads(job);
   void registerStoredFile({
     lookupKey: job.dlKey,
     filePath: job.filePath,
@@ -469,6 +581,40 @@ function registerFinishedFile(job: Job): void {
   });
 }
 
+/* ---------------- self-healing retry ---------------- */
+
+/**
+ * Re-queue a job that died from a TRANSIENT error. The egress lane is
+ * re-probed first (a recovered tunnel gets picked for the retry) and yt-dlp
+ * resumes the .part file it already wrote — no bytes re-downloaded.
+ * Terminal errors (private video, age gate, bad URL…) never retry.
+ */
+function scheduleJobRetry(job: Job, errCode: string): boolean {
+  if (TERMINAL_JOB_CODES.has(errCode)) return false;
+  if ((job.retries ?? 0) >= MAX_JOB_RETRIES) return false;
+  if (!job.lastArgs || job.lastArgs.length === 0) return false;
+  job.retries = (job.retries ?? 0) + 1;
+  job.state = "queued";
+  job.phase = "queue";
+  job.progress = 0;
+  job.error = null;
+  job.speed = null;
+  job.eta = null;
+  job.createdAt = Date.now(); // reset the TTL clock for the new attempt
+  console.log(
+    `[jobs] job ${job.id} transient failure (${errCode}) — retry ${job.retries}/${MAX_JOB_RETRIES}`,
+  );
+  const delay = 4_000 * job.retries;
+  setTimeout(() => {
+    // re-probe lanes so a recovered tunnel is active before the retry spawns
+    void probeAll().finally(() => {
+      job.args = job.lastArgs;
+      pump();
+    });
+  }, delay);
+  return true;
+}
+
 /* ---------------- progress parsing ---------------- */
 
 async function attachYtdlpOutput(job: Job, proc: ChildProcess): Promise<void> {
@@ -480,6 +626,7 @@ async function attachYtdlpOutput(job: Job, proc: ChildProcess): Promise<void> {
       if (pct) {
         job.state = "downloading";
         job.phase = "download";
+        job.lastProgressAt = Date.now();
         job.progress = Math.min(0.97, parseFloat(pct[1]) / 100);
         const spd = line.match(/at\s+([\d.]+\w*\/s)/);
         if (spd) job.speed = spd[1];
@@ -529,6 +676,10 @@ async function attachYtdlpOutput(job: Job, proc: ChildProcess): Promise<void> {
       }
     } else {
       const err = classifyStderr(stderr);
+      if (scheduleJobRetry(job, err.code)) {
+        pump();
+        return;
+      }
       job.state = "error";
       job.error = err.code;
       console.error(`[jobs] yt-dlp job ${job.id} failed (${err.code}): ${stderr.slice(-400).replace(/\n/g, " | ")}`);
@@ -546,6 +697,7 @@ async function attachFfmpegOutput(job: Job, proc: ChildProcess): Promise<void> {
       const m = line.match(/out_time_us=(\d+)/) || line.match(/out_time_ms=(\d+)/);
       if (m && job.durationSec > 0) {
         const done = parseInt(m[1], 10) / 1_000_000;
+        job.lastProgressAt = Date.now();
         job.progress = Math.min(0.98, done / job.durationSec);
         job.state = job.progress >= 0.98 ? "merging" : "downloading";
         job.phase = job.progress >= 0.98 ? "merge" : "download";
@@ -597,8 +749,13 @@ async function attachFfmpegOutput(job: Job, proc: ChildProcess): Promise<void> {
         job.error = "INTERNAL";
       }
     } else {
+      const errCode = /403|401/.test(stderr) ? "EXPIRED" : "FETCH_FAILED";
+      if (scheduleJobRetry(job, errCode)) {
+        pump();
+        return;
+      }
       job.state = "error";
-      job.error = /403|401/.test(stderr) ? "EXPIRED" : "FETCH_FAILED";
+      job.error = errCode;
     }
     pump();
   });

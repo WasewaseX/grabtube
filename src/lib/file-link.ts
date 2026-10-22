@@ -25,6 +25,7 @@ import {
   findStoredByLookupKey,
   lookupKeyFor,
   registerStoredFile,
+  videoKeyFromFormat,
   type StoredFileInfo,
 } from "@/lib/store";
 
@@ -63,6 +64,27 @@ function jobRegistry(): Map<string, RegistryEntry> {
 
 export function specKey(spec: LinkSpec): string {
   return lookupKeyFor(spec.webpageUrl, spec.format, spec.bitrate);
+}
+
+/**
+ * Storage identity for a link spec. Video itags DRIFT between extraction
+ * sessions (same 360p H.264 selection → itag 134 one hour, 230 the next),
+ * so video links resolve to a SEMANTIC key (height+fps+codec+container).
+ * Audio conversions keep the exact target key (mp3/320 etc.). Resolving
+ * here — not just at registration — makes a link hit land on the shared
+ * stored file no matter which itag variant the link was minted with.
+ */
+async function resolveStorageKey(spec: LinkSpec): Promise<string> {
+  const isAudio = AUDIO_TARGETS.has(spec.format.toLowerCase());
+  if (isAudio || !spec.format.includes("|")) return specKey(spec);
+  try {
+    const { raw } = await loadRawInfo(spec.webpageUrl);
+    const vId = spec.format.split("|")[0];
+    const vf = raw.formats.find((f) => f.format_id === vId) ?? null;
+    return videoKeyFromFormat(spec.webpageUrl, vf, spec.format);
+  } catch {
+    return specKey(spec); // extraction down → identity falls back to itag
+  }
 }
 
 /** webpage URL → RawInfo via the shared info store (re-extracts when cold). */
@@ -160,7 +182,7 @@ export type EnsureResult =
  * on this server. Otherwise starts the server-side fetch and reports busy.
  */
 export async function ensureFileForLink(spec: LinkSpec): Promise<EnsureResult> {
-  const key = specKey(spec);
+  const key = await resolveStorageKey(spec);
 
   /* 1 — already downloaded & registered → serve from disk */
   const stored = await findStoredByLookupKey(key);

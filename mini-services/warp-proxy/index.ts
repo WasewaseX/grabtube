@@ -26,13 +26,31 @@ const HTTP_PORT = 41081;
 
 let child: ReturnType<typeof Bun.spawn> | null = null;
 let restarting = false;
+/** exponential restart backoff — restart-storms generate handshake spam that
+ *  gets the WARP identity device-throttled by Cloudflare (tunnel then stays
+ *  dead for a LONG time; a fresh identity is the only cure) */
+let restartDelayMs = 2000;
+const RESTART_DELAY_CAP = 60_000;
 
 /** WARP officially supports many UDP ports; networks sometimes throttle one,
- *  so we rotate automatically when handshakes stop completing. */
-const ENDPOINT_PORTS = [928, 500, 854, 894, 1701, 1843, 2506, 4500, 2408, 939, 945, 903];
+ *  so we rotate automatically when handshakes stop completing. The
+ *  registration API lists [2408, 500, 1701, 4500] — those go first.
+ *  NOTE: this sandbox only completes handshakes on 928 (measured 2026-10-23
+ *  sweep) — it MUST stay first or rotation walks into a death spiral. */
+const ENDPOINT_PORTS = [928, 2408, 500, 1701, 4500, 854, 894, 1843, 2506, 939, 945, 903];
 let portIdx = Math.max(0, ENDPOINT_PORTS.indexOf(currentEndpointPort()));
 let handshakeFails = 0;
 let lastHandshakeOk = 0;
+
+function currentEndpointIp(): string {
+  try {
+    const conf = readFileSync(CONF, "utf8");
+    const m = conf.match(/^Endpoint = ([^:]+):/m);
+    return m ? m[1] : "162.159.192.7";
+  } catch {
+    return "162.159.192.7";
+  }
+}
 
 function currentEndpointPort(): number {
   try {
@@ -44,13 +62,39 @@ function currentEndpointPort(): number {
   }
 }
 
+/** rotate across Cloudflare's engage endpoint IPs too — a degraded NAT flow
+ *  to one IP often stays degraded; a new IP + port pair forces fresh paths */
+const ENDPOINT_IPS = [
+  "162.159.192.7", "162.159.192.1", "162.159.193.10", "162.159.193.1",
+  "162.159.204.1", "162.159.192.3", "162.159.193.5", "162.159.204.3",
+];
+let ipIdx = 0;
+/** last endpoint pair that completed handshakes — rotation snaps back here
+ *  before wandering into untested combos (a known-good pair beats a roulette) */
+let lastGood: { ip: string; port: number } | null = null;
+
 function rotateEndpoint(reason: string) {
+  // snap back to the last proven-working pair before trying new combos
+  const confIp = currentEndpointIp();
+  const confPort = currentEndpointPort();
+  if (lastGood && (lastGood.ip !== confIp || lastGood.port !== confPort)) {
+    try {
+      const conf = readFileSync(CONF, "utf8");
+      writeFileSync(CONF, conf.replace(/^Endpoint = .*$/m, `Endpoint = ${lastGood.ip}:${lastGood.port}`));
+      console.log(`[warp-proxy] snapping back to known-good → ${lastGood.ip}:${lastGood.port} (${reason})`);
+      return;
+    } catch (e) {
+      console.error(`[warp-proxy] snap-back failed: ${String(e)}`);
+    }
+  }
   portIdx = (portIdx + 1) % ENDPOINT_PORTS.length;
   const port = ENDPOINT_PORTS[portIdx];
+  ipIdx = (ipIdx + 1) % ENDPOINT_IPS.length;
+  const ip = ENDPOINT_IPS[ipIdx];
   try {
     const conf = readFileSync(CONF, "utf8");
-    writeFileSync(CONF, conf.replace(/^Endpoint = .*$/m, `Endpoint = 162.159.192.1:${port}`));
-    console.log(`[warp-proxy] rotating endpoint → 162.159.192.1:${port} (${reason})`);
+    writeFileSync(CONF, conf.replace(/^Endpoint = .*$/m, `Endpoint = ${ip}:${port}`));
+    console.log(`[warp-proxy] rotating endpoint → ${ip}:${port} (${reason})`);
   } catch (e) {
     console.error(`[warp-proxy] rotate failed: ${String(e)}`);
   }
@@ -92,6 +136,7 @@ function startWireproxy() {
               // which the health prober measures — see probe loop below
               handshakeFails = 0;
               lastHandshakeOk = Date.now();
+              markTunnelAlive();
             }
           }
         }
@@ -114,10 +159,17 @@ function startWireproxy() {
 function scheduleRestart() {
   if (restarting) return;
   restarting = true;
+  const delay = restartDelayMs;
+  restartDelayMs = Math.min(restartDelayMs * 2, RESTART_DELAY_CAP);
   setTimeout(() => {
     restarting = false;
     if (!child) startWireproxy();
-  }, 2000);
+  }, delay);
+}
+
+/** a healthy probe (or live handshake) resets the backoff ramp */
+function markTunnelAlive() {
+  restartDelayMs = 2000;
 }
 
 /** Active health probe: if the tunnel stops passing traffic, rotate + restart. */
@@ -131,6 +183,13 @@ async function healthProbe() {
     if (res.ok && text.includes("warp=on")) {
       handshakeFails = 0;
       lastHandshakeOk = Date.now();
+      markTunnelAlive();
+      try {
+        const m = readFileSync(CONF, "utf8").match(/^Endpoint = (\S+):(\d+)/m);
+        if (m) lastGood = { ip: m[1], port: m[2] };
+      } catch {
+        /* noop */
+      }
       console.log(`[warp-proxy] health OK (${new Date().toISOString()})`);
       return;
     }

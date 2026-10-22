@@ -49,7 +49,41 @@ function newToken(): string {
 }
 
 export function lookupKeyFor(webpageUrl: string, format: string, bitrate?: number): string {
-  return `${webpageUrl}::${format}::${bitrate || 0}`;
+  // Normalize DRC audio variants ("140-drc" → "140"): the picker prefers DRC
+  // tracks, but they're the same content as the plain itag — without this the
+  // same visible file would be downloaded and stored TWICE under two keys
+  // (manual/API links vs UI-built composites) instead of sharing one token.
+  const norm = format.replace(/(\d+)-drc/gi, "$1");
+  return `${webpageUrl}::${norm}::${bitrate || 0}`;
+}
+
+/**
+ * Semantic video storage key — YouTube itags DRIFT between extraction
+ * sessions (360p H.264 came back as itag 134 in one fetch and 230 in the
+ * next for the same video), so keying storage by raw itag stores the same
+ * visible file several times. Keying by height+fps+codec+container instead
+ * means every variant of "360p H.264 mp4" shares ONE stored file/token.
+ * Falls back to the plain itag key when the format entry is unavailable.
+ */
+export function videoKeyFromFormat(
+  webpageUrl: string,
+  f: { height?: number | null; fps?: number | null; vcodec?: string | null; ext?: string | null } | null,
+  fallbackFormat: string,
+): string {
+  if (f?.height) {
+    const vc = (f.vcodec ?? "").toLowerCase();
+    const codec = /avc1|h264/.test(vc)
+      ? "h264"
+      : /vp0?9/.test(vc)
+        ? "vp9"
+        : /av01|av1/.test(vc)
+          ? "av1"
+          : vc ? vc.slice(0, 10) : "any";
+    const fps = f.fps && f.fps > 30 ? Math.round(f.fps) : 0;
+    const container = (f.ext || fallbackFormat.split("|")[2] || "mp4").toLowerCase();
+    return `${webpageUrl}::v|h${f.height}${fps ? `f${fps}` : ""}|${codec}|${container}::0`;
+  }
+  return lookupKeyFor(webpageUrl, fallbackFormat);
 }
 
 function toInfo(row: {

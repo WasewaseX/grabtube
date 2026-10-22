@@ -471,7 +471,7 @@ export function baseArgs(): string[] {
     '--socket-timeout', '20',
     '--retries', '15',
     '--fragment-retries', '15',
-    '--extractor-retries', '2',
+    '--extractor-retries', '3',
     '--force-ipv4',
     '--no-check-certificates',
     '--no-playlist',
@@ -490,6 +490,29 @@ export function baseArgs(): string[] {
   const proxy = ytDlpProxy()
   if (proxy) args.push('--proxy', proxy)
   return args
+}
+
+/**
+ * Snappy variant for INTERACTIVE info fetches (the /api/info route): the
+ * extraction UI must answer within Caddy's ~4.6 min gateway budget and feel
+ * fast when the tunnel is healthy. Tight per-attempt timeouts make a wedged
+ * client step bail quickly so the chain rotates to a healthy one — server
+ * jobs keep the patient baseArgs() instead (resume .part + full retries).
+ */
+export function infoArgs(): string[] {
+  return [
+    '--socket-timeout', '12',
+    '--retries', '3',
+    '--fragment-retries', '5',
+    '--extractor-retries', '1',
+    '--force-ipv4',
+    '--no-check-certificates',
+    '--no-playlist',
+    '--remote-components', 'ejs:github',
+    '--extractor-args',
+    `youtubepot-bgutilscript:server_home=${path.join(PROJECT_ROOT, 'mini-services/pot-provider/server')}`,
+    '--extractor-args', `youtubepot-bgutilhttp:base_url=${POT_SERVER_URL}`,
+  ]
 }
 
 /** Engine descriptor for server-side jobs. */
@@ -577,15 +600,17 @@ export async function fetchInfo(url: string): Promise<{ infoId: string; raw: Raw
   let rotatedVisitor = false
   const errors: Classified[] = []
   const MAX_STEPS = 4
+  const INFO_DEADLINE = Date.now() + 110_000 // overall budget for the client chain
   // keep the richest degraded response — if every step is unhealthy we still
   // return it instead of erroring out (1-format info beats no info)
   let bestRaw: RawInfo | null = null
 
   for (let i = 0; i < Math.min(MAX_STEPS, CLIENT_CHAIN.length); i++) {
+    if (Date.now() > INFO_DEADLINE) break // budget spent → let providers answer
     const step = CLIENT_CHAIN[i]
     const { code, stdout, stderr } = await runYtDlp(
-      ['-J', ...baseArgs(), ...step, ...(cookies ? ['--cookies', cookies] : []), clean],
-      90000,
+      ['-J', ...infoArgs(), ...step, ...(cookies ? ['--cookies', cookies] : []), clean],
+      45000,
     )
     if (code === 0 && stdout.trim().startsWith('{')) {
       const raw = await parseRaw(stdout, clean)

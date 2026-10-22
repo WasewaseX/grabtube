@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { createJob, jobStore, publicJob, ensureCleanupTimer, type CreateJobInput } from "@/lib/jobs";
 import { getInfo, type RawInfo, type YtRawFormat, DlError } from "@/lib/ytdlp";
 import { isProxySource } from "@/lib/extract";
-import { lookupKeyFor } from "@/lib/store";
+import { lookupKeyFor, videoKeyFromFormat } from "@/lib/store";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -93,11 +93,15 @@ function buildInput(
   const webpageUrl = base.webpageUrl || "";
   const fmtSpec = body.videoFormatId || body.audioFormat || "";
   if (/^https?:\/\//.test(webpageUrl) && fmtSpec) {
-    base.dlKey = lookupKeyFor(
-      webpageUrl,
-      fmtSpec,
-      mode === "mp3" ? body.bitrate : undefined,
-    );
+    if (mode === "mp3") {
+      base.dlKey = lookupKeyFor(webpageUrl, fmtSpec, body.bitrate);
+    } else {
+      // semantic key: itags drift between sessions — identity is
+      // height+fps+codec+container so every variant shares one stored file
+      const vId = fmtSpec.split("|")[0];
+      const vf = raw.formats.find((f) => f.format_id === vId) ?? null;
+      base.dlKey = videoKeyFromFormat(webpageUrl, vf, fmtSpec);
+    }
   }
 
   if (!isProxySource(raw)) return base;

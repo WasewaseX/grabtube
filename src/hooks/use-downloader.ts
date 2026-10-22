@@ -34,6 +34,10 @@ export interface DownloadItem {
   speed: number; // bytes/sec
   error?: string;
   jobId?: string;
+  /** permanent self-contained direct link (/api/dl) — works in any browser
+   *  or download manager (IDM/aria2) WITHOUT visiting YouTube; the server
+   *  does the whole download and serves the file with Range/resume */
+  directLink?: string;
   videoUrl?: string; // for history
   thumb?: string;
 }
@@ -97,6 +101,32 @@ function mimeForExt(ext: string): string {
     default:
       return "application/octet-stream";
   }
+}
+
+/**
+ * Build the PERMANENT self-contained direct link (/api/dl) for a selection.
+ * The link encodes the video URL + format + quality + title; when any client
+ * (browser, IDM, aria2, curl) hits it, the SERVER does the full YouTube
+ * download/merge/convert and serves the finished file with Range support.
+ * Survives restarts and session expiry — re-resolves on demand.
+ */
+export function buildDlLink(
+  fmt: PublicFormat,
+  info: PublicInfo,
+  bitrate?: number,
+): string {
+  const isConversion =
+    fmt.kind === "audio" &&
+    (fmt.id === "convert" || ["mp3", "flac", "wav"].includes(fmt.container));
+  const f = isConversion ? fmt.container : fmt.id;
+  const qs = new URLSearchParams({
+    u: info.webpageUrl,
+    f,
+    q: fmt.quality || "",
+    t: info.title || "",
+  });
+  if (isConversion && fmt.container === "mp3") qs.set("b", String(bitrate ?? 320));
+  return `/api/dl?${qs.toString()}`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -492,19 +522,28 @@ export function useDownloader() {
         speed: 0,
         videoUrl: infoData.webpageUrl,
         thumb: infoData.thumbnail,
+        directLink: buildDlLink(fmt, infoData, overrideBitrate),
       };
       setItems((prev) => [shell, ...prev].slice(0, 12));
 
       try {
-        if (fmt.needsMerge || isConversion) {
-          /* ---------- server job (merge / audio conversion) ---------- */
+        /* ================================================================
+         * MIDDLEMAN FLOW — every download is a server job. The server
+         * (fast pipe + WARP) pulls from YouTube FIRST; the user's browser
+         * or external manager then fetches the finished file from THIS
+         * app with Range/resume. The user's own connection never touches
+         * YouTube, which is what makes this reliable on slow/censored
+         * networks (Iran etc.).
+         * ================================================================ */
+        {
+          const isMerge = fmt.needsMerge;
           const res = await fetch("/api/jobs", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               infoId: infoData.infoId,
-              mode: isConversion ? "mp3" : "merge",
-              videoFormatId: fmt.needsMerge ? fmt.id : undefined,
+              mode: isConversion ? "mp3" : isMerge ? "merge" : "file",
+              videoFormatId: isConversion ? undefined : fmt.id,
               audioFormat: isConversion ? fmt.container : undefined,
               bitrate: isConversion ? overrideBitrate ?? 320 : undefined,
               title: infoData.title,
@@ -526,25 +565,6 @@ export function useDownloader() {
                 headers: range ? { Range: range } : undefined,
               }),
             { ...shell, directUrl: fileUrl },
-            fmt.filesize || 0,
-            ctrl.signal,
-          );
-        } else {
-          /* ---------- instant pipe ---------- */
-          const qs = new URLSearchParams({
-            infoId: infoData.infoId,
-            formatId: fmt.id,
-            q: fmt.quality,
-          });
-          const dlUrl = `/api/download?${qs}`;
-          await streamToDisk(
-            id,
-            (range) =>
-              fetch(dlUrl, {
-                signal: ctrl.signal,
-                headers: range ? { Range: range } : undefined,
-              }),
-            { ...shell, directUrl: dlUrl },
             fmt.filesize || 0,
             ctrl.signal,
           );

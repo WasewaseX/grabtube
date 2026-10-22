@@ -100,6 +100,8 @@ async function loadRaw(webpageUrl: string): Promise<{ infoId: string; raw: RawIn
   return fresh;
 }
 
+const AUDIO_CONVERT_FORMATS = new Set(["mp3", "m4a", "opus", "flac", "wav"]);
+
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const format = searchParams.get("f") || "";
@@ -112,9 +114,9 @@ export async function GET(req: Request) {
   if (!format) return jsonError("INVALID_URL", "Missing format parameter.", 400);
 
   /* ==================================================================== */
-  /* merge / mp3 → shared job → serve finished file with Range            */
+  /* merge / audio-convert → shared job → serve finished file with Range   */
   /* ==================================================================== */
-  if (format.includes("|") || format === "mp3") {
+  if (format.includes("|") || AUDIO_CONVERT_FORMATS.has(format.toLowerCase())) {
     let infoId: string;
     let raw: RawInfo;
     try {
@@ -126,14 +128,15 @@ export async function GET(req: Request) {
       return jsonError(code, "Could not resolve this video.", 502, 30);
     }
 
+    const audioFmt = format.toLowerCase();
+    const isAudio = AUDIO_CONVERT_FORMATS.has(audioFmt);
     const title = sanitizeFilename(titleParam || raw.title || "video");
-    const isMp3 = format === "mp3";
-    const container = isMp3 ? "mp3" : (format.split("|")[2] || "mkv").toLowerCase();
+    const container = isAudio ? audioFmt : (format.split("|")[2] || "mkv").toLowerCase();
     const filename = sanitizeFilename(
       `${title}${qualityLabel ? ` (${qualityLabel})` : ""}.${container}`,
     );
 
-    const regKey = `${target}::${format}::${isMp3 ? bitrate || 320 : 0}`;
+    const regKey = `${target}::${format}::${isAudio ? bitrate || 0 : 0}`;
     const registry = dlJobRegistry();
 
     let jobId = registry.get(regKey);
@@ -149,16 +152,17 @@ export async function GET(req: Request) {
       try {
         const job = createJob({
           infoId,
-          mode: isMp3 ? "mp3" : "merge",
-          videoFormatId: isMp3 ? undefined : format,
-          bitrate: isMp3 ? bitrate : undefined,
+          mode: isAudio ? "mp3" : "merge",
+          videoFormatId: isAudio ? undefined : format,
+          audioFormat: isAudio ? audioFmt : undefined,
+          bitrate: isAudio ? bitrate : undefined,
           webpageUrl: target,
           title,
           duration: raw.duration,
         });
         jobId = job.id;
         registry.set(regKey, jobId);
-        console.log(`[dl] merge job ${jobId} created for ${regKey.slice(0, 90)}`);
+        console.log(`[dl] job ${jobId} created for ${regKey.slice(0, 90)}`);
       } catch (e) {
         const code = (e as { code?: string }).code || "INTERNAL";
         return jsonError(code, "Could not start the server-side conversion.", 500);

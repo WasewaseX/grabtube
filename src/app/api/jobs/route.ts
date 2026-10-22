@@ -25,7 +25,7 @@ export async function GET() {
 export async function POST(req: Request) {
   let body: {
     infoId?: string;
-    mode?: "merge" | "mp3";
+    mode?: "merge" | "mp3" | "file";
     videoFormatId?: string;
     bitrate?: number;
     audioFormat?: string;
@@ -48,7 +48,8 @@ export async function POST(req: Request) {
     );
   }
   const raw = entry.raw;
-  const mode = body.mode === "mp3" ? "mp3" : "merge";
+  const mode: "merge" | "mp3" | "file" =
+    body.mode === "mp3" ? "mp3" : body.mode === "file" ? "file" : "merge";
 
   try {
     const input = buildInput(infoId, raw, mode, body);
@@ -69,7 +70,7 @@ export async function POST(req: Request) {
 function buildInput(
   infoId: string,
   raw: RawInfo,
-  mode: "merge" | "mp3",
+  mode: "merge" | "mp3" | "file",
   body: { videoFormatId?: string; bitrate?: number; audioFormat?: string; title?: string; webpageUrl?: string; duration?: number },
 ): CreateJobInput {
   const base: CreateJobInput = {
@@ -92,6 +93,16 @@ function buildInput(
     const bestAudio = bestAudioFormat(formats);
     if (bestAudio?.url) {
       return { ...base, mode: "urlaudio", urls: { audio: bestAudio.url } };
+    }
+    return base;
+  }
+
+  if (mode === "file") {
+    // single instant format from a provider → ffmpeg remux of the direct URL
+    const fmtId = (body.videoFormatId || "").split("|")[0];
+    const stored = formats.find((f) => f.format_id === fmtId);
+    if (stored?.url) {
+      return { ...base, mode: "urlfile", urls: { video: stored.url } };
     }
     return base;
   }

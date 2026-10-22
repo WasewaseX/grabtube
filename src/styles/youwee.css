@@ -128,6 +128,7 @@
 .chip:disabled { opacity: 0.35; cursor: not-allowed; }
 
 .meta-row { display: flex; gap: 8px; margin: 12px 2px; font-size: 13px; }
+.dl-row { display: flex; gap: 8px; margin-top: 4px; }
 .muted { color: var(--muted); }
 
 /* ---------------- jobs ---------------- */

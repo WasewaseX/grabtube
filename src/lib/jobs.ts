@@ -1,15 +1,27 @@
 /**
- * Server-side download jobs.
+ * Server-side download jobs — the MIDDLEMAN engine.
+ *
+ * The server (fast datacenter pipe + WARP egress) always downloads from
+ * YouTube FIRST, at full speed. The user's browser/downloader then pulls the
+ * finished file from this server with Range/resume support — YouTube is never
+ * involved in the user's own connection (crucial for slow/censored networks).
  *
  *  • merge / mp3    – yt-dlp downloads the selected tracks (optionally merging
  *                     with ffmpeg) and reports --newline progress.
+ *  • file           – yt-dlp downloads ONE format (muxed video or native
+ *                     audio) server-side. Used for "instant" formats so the
+ *                     user never live-streams from YouTube through the app.
  *  • urlmerge       – ffmpeg pulls the video+audio direct URLs itself and
  *                     stream-copies them into one container. Used when the
  *                     format list came from a proxy provider (Piped/Invidious).
  *  • urlaudio       – ffmpeg pulls an audio direct URL and converts to MP3.
+ *  • urlfile        – ffmpeg pulls a single direct URL and remuxes to the
+ *                     target container (proxy-source instant formats).
  *
  * Jobs write to a temp file while emitting live progress, then the client
- * streams the finished file from /api/jobs/[id]/file.
+ * streams the finished file from /api/jobs/[id]/file. Finished files are kept
+ * for hours (touch-extended while actively being downloaded) so slow
+ * connections can pause/resume and external managers can re-hit the link.
  */
 import { spawn, type ChildProcess } from "child_process";
 import { randomUUID } from "crypto";
@@ -44,10 +56,13 @@ export interface Job {
   receivedBytes: number;
   sizeBytes: number | null;
   error: string | null;
-  mode: "merge" | "mp3" | "urlmerge" | "urlaudio";
+  mode: "merge" | "mp3" | "urlmerge" | "urlaudio" | "file" | "urlfile";
   createdAt: number;
   filePath: string | null;
   proc: ChildProcess | null;
+  /** last time a client pulled (or resumed) this job's file — keeps the
+   *  cleanup away from files an external manager is still downloading */
+  lastServeAt: number | null;
   args?: string[]; // pending spawn args for queued jobs
   engine: "ytdlp" | "ffmpeg";
   durationSec: number; // for ffmpeg progress math
@@ -64,7 +79,11 @@ export function jobStore(): Map<string, Job> {
 }
 
 const MAX_CONCURRENT_JOBS = 2;
-const JOBS_TTL_MS = 45 * 60 * 1000;
+/** finished files stay grabbable for 6h — direct links keep working long
+ *  after the download started (slow networks, IDM queued overnight…) */
+const JOBS_TTL_MS = 6 * 60 * 60 * 1000;
+/** a file served within this window is considered actively downloading */
+const ACTIVE_SERVE_MS = 10 * 60 * 1000;
 
 export function jobsDir(): string {
   const dir = path.join(tmpdir(), "tubegrab-jobs");
@@ -82,7 +101,14 @@ export function ensureCleanupTimer(): void {
       const expired = now - job.createdAt > JOBS_TTL_MS;
       const dead =
         (job.state === "cancelled" || job.state === "error") && now - job.createdAt > 10 * 60 * 1000;
-      if (expired || dead) {
+      // actively downloading server-side → never touch (a 2160p merge can
+      // legitimately run past an hour; killing it corrupts the transfer)
+      const running =
+        (job.state === "downloading" || job.state === "merging") &&
+        now - job.createdAt < 3 * 60 * 60 * 1000;
+      // an external manager is mid-download of the finished file → keep it
+      const servedRecently = job.lastServeAt != null && now - job.lastServeAt < ACTIVE_SERVE_MS;
+      if ((expired && !running && !servedRecently) || dead) {
         if (job.proc) {
           try {
             job.proc.kill("SIGKILL");
@@ -159,8 +185,8 @@ function spawnFfmpegJob(job: Job, args: string[]): void {
 
 export interface CreateJobInput {
   infoId: string;
-  mode: "merge" | "mp3" | "urlmerge" | "urlaudio";
-  videoFormatId?: string; // composite "videoId|audioId|container" for merge
+  mode: "merge" | "mp3" | "urlmerge" | "urlaudio" | "file" | "urlfile";
+  videoFormatId?: string; // composite "videoId|audioId|container" for merge; single itag for file
   bitrate?: number;
   /** target container for audio-conversion jobs (mp3/m4a/opus/flac/wav) */
   audioFormat?: string;
@@ -243,6 +269,8 @@ export function createJob(input: CreateJobInput): Job {
       ...CLIENT_CHAIN[0],
       "--no-playlist",
       "--newline",
+      "-N",
+      "8",
       "-f",
       "bestaudio/best",
       "-x",
@@ -255,6 +283,48 @@ export function createJob(input: CreateJobInput): Job {
       "-o",
       path.join(jobsDir(), `${jobId}.%(ext)s`),
       input.webpageUrl || raw.webpage_url,
+    ];
+  } else if (mode === "file") {
+    // single-format server-side download (muxed video / native audio) —
+    // "instant" formats go through this too so the user NEVER live-streams
+    // from YouTube through the app; they always pull a local, resumable file
+    const fmtId = (input.videoFormatId || "").split("|")[0];
+    if (!fmtId) throw new DlError("INVALID_URL", "Missing format id.");
+    const stored = raw.formats.find((f) => f.format_id === fmtId);
+    ext = (stored?.ext || "mp4").toLowerCase();
+    engine = "ytdlp";
+    args = [
+      ...baseArgs(),
+      ...CLIENT_CHAIN[0],
+      "--no-playlist",
+      "--newline",
+      "-N",
+      "8",
+      "-f",
+      `${fmtId}/best`,
+      "-o",
+      path.join(jobsDir(), `${jobId}.%(ext)s`),
+      input.webpageUrl || raw.webpage_url,
+    ];
+  } else if (mode === "urlfile") {
+    // proxy-provider single stream → ffmpeg remux into the target container
+    if (!input.urls?.video) throw new DlError("INVALID_URL", "Missing stream URL.");
+    const fmtId = (input.videoFormatId || "").split("|")[0];
+    const stored = raw.formats.find((f) => f.format_id === fmtId);
+    ext = (stored?.ext || "mp4").toLowerCase();
+    engine = "ffmpeg";
+    const out = path.join(jobsDir(), `${randomUUID()}.${ext}`);
+    const isMp4 = ext === "mp4";
+    args = [
+      "-y",
+      "-i",
+      input.urls.video,
+      "-c",
+      "copy",
+      ...(isMp4 ? ["-movflags", "+faststart"] : []),
+      "-progress",
+      "pipe:1",
+      out,
     ];
   } else if (mode === "urlaudio") {
     if (!input.urls?.audio) throw new DlError("INVALID_URL", "Missing audio stream URL.");
@@ -307,6 +377,8 @@ export function createJob(input: CreateJobInput): Job {
       ...CLIENT_CHAIN[0],
       "--no-playlist",
       "--newline",
+      "-N",
+      "8",
       "-f",
       `${vId}+${aId}/${qualityFallback}/bestvideo+bestaudio/best`,
       "--merge-output-format",
@@ -335,6 +407,7 @@ export function createJob(input: CreateJobInput): Job {
     createdAt: Date.now(),
     filePath: null,
     proc: null,
+    lastServeAt: null,
     engine,
     durationSec,
   };
@@ -528,17 +601,13 @@ export function jobFilePath(id: string): { path: string; job: Job } | null {
   return { path: job.filePath, job };
 }
 
+/**
+ * Touch the job's serve timestamp. Files are NO LONGER deleted shortly after
+ * serving — external download managers on slow networks may take hours and
+ * resume with Range requests; deleting under them breaks the transfer.
+ * The TTL cleaner removes files hours later (extend-aware, see cleanup).
+ */
 export function markServed(id: string): void {
   const job = jobStore().get(id);
-  if (!job) return;
-  setTimeout(() => {
-    if (job.filePath && existsSync(job.filePath)) {
-      try {
-        rmSync(job.filePath, { force: true });
-      } catch {
-        /* noop */
-      }
-    }
-    jobStore().delete(id);
-  }, 90_000);
+  if (job) job.lastServeAt = Date.now();
 }

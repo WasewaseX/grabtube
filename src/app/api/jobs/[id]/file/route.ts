@@ -7,9 +7,12 @@ import { contentDisposition } from "@/lib/http-utils";
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-/** Streams a finished merge/MP3 job file. Range requests are honored so the
- *  in-app downloader can resume after a mid-transfer disconnect on slow
- *  networks. Served-once cleanup only runs for FULL (non-Range) requests. */
+/** Streams a finished merge/MP3/file job. Range requests are honored so the
+ *  in-app downloader and external managers (IDM/aria2 on slow networks) can
+ *  resume after a mid-transfer disconnect. Every hit touches the job's
+ *  serve timestamp, which keeps the TTL cleaner away from files that are
+ *  still being downloaded. Files are kept for hours — the link stays valid
+ *  so it can be re-pasted or resumed at any time. */
 export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
   const found = jobFilePath(id);
@@ -50,7 +53,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
     nodeStream.destroy();
   });
 
-  if (!partial) markServed(id); // full download → schedule the usual cleanup
+  markServed(id); // touch (never delete-under-downloader; TTL cleaner handles removal)
 
   const out = new Headers();
   out.set("Content-Type", found.job.mime);

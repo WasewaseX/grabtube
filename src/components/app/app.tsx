@@ -8,8 +8,9 @@
  * (WARP egress lane, PO tokens, client rotation).
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { toast } from "sonner";
 import "@/styles/youwee.css";
-import { useDownloader, type DownloadItem } from "@/hooks/use-downloader";
+import { useDownloader, buildDlLink, type DownloadItem } from "@/hooks/use-downloader";
 import { LangProvider } from "@/hooks/use-lang";
 import type { PublicFormat, PublicInfo } from "@/lib/ytdlp";
 
@@ -367,9 +368,28 @@ function VideoPanel(p: VideoPanelProps) {
         <span className="muted">Container</span> {containers}
       </div>
 
-      <button className="btn primary big" onClick={download} disabled={disabled}>
-        Download
-      </button>
+      <div className="dl-row">
+        <button className="btn primary big" onClick={download} disabled={disabled} style={{ flex: 1 }}>
+          Download
+        </button>
+        <button
+          className="btn ghost big"
+          style={{ width: "auto", padding: "0 16px", whiteSpace: "nowrap" }}
+          disabled={disabled}
+          onClick={() => {
+            const fmt = p.audioMode ? audioChosen : chosen;
+            if (!fmt) return;
+            const link = buildDlLink(fmt, info, p.audioFmt === "MP3" ? p.mp3Bitrate : undefined);
+            const abs = `${window.location.origin}${link}`;
+            void navigator.clipboard?.writeText(abs).catch(() => undefined);
+            toast.success("Direct link copied", {
+              description: "Paste it in any browser or download manager (IDM, aria2…) — the server downloads from YouTube and serves the file with resume support.",
+            });
+          }}
+        >
+          🔗 Direct link
+        </button>
+      </div>
     </section>
   );
 }
@@ -396,7 +416,7 @@ function JobsList({
   onClearFinished,
 }: {
   items: DownloadItem[];
-  onCancel: (id: string) => void;
+  onCancel: (item: DownloadItem) => void;
   onRemove: (id: string) => void;
   onClearFinished: () => void;
 }) {
@@ -435,7 +455,7 @@ function JobRow({
   onRemove,
 }: {
   it: DownloadItem;
-  onCancel: (id: string) => void;
+  onCancel: (item: DownloadItem) => void;
   onRemove: (id: string) => void;
 }) {
   const working = ["starting", "queued", "downloading", "merging", "saving"].includes(it.state);
@@ -475,11 +495,26 @@ function JobRow({
       <div style={{ minWidth: 0 }}>
         <div className="job-title">{it.title}</div>
         <div className="job-sub">{sub}</div>
+        {it.directLink && (
+          <button
+            className="x-btn"
+            style={{ marginTop: 4 }}
+            onClick={() => {
+              const abs = `${window.location.origin}${it.directLink}`;
+              void navigator.clipboard?.writeText(abs).catch(() => undefined);
+              toast.success("Direct link copied", {
+                description: "Works in any browser or download manager — the server fetches from YouTube and serves the file with resume.",
+              });
+            }}
+          >
+            🔗 Copy direct link
+          </button>
+        )}
       </div>
       <div className="job-right">
         <span className={"badge " + badgeCls}>{badge}</span>
         {working ? (
-          <button className="x-btn" onClick={() => onCancel(it.id)}>
+          <button className="x-btn" onClick={() => onCancel(it)}>
             Cancel
           </button>
         ) : (
@@ -507,7 +542,7 @@ function Settings({ onClose }: { onClose: () => void }) {
   const [proxies, setProxies] = useState("");
   const [cookies, setCookies] = useState("");
   const [hasCookies, setHasCookies] = useState(false);
-  const [lanes, setLanes] = useState<{ id: string; label: string; healthy: boolean; active: boolean; note?: string }[]>([]);
+  const [lanes, setLanes] = useState<{ id: string; label: string; healthy: boolean; active: boolean; egressIp?: string | null; note?: string }[]>([]);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 

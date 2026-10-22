@@ -137,6 +137,7 @@ export type DlErrorCode =
   | 'EXPIRED'
   | 'NOT_FOUND'
   | 'NO_FFMPEG'
+  | 'DISK_FULL'
   | 'INTERNAL'
 
 export class DlError extends Error {

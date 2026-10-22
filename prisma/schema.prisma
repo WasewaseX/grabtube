@@ -43,3 +43,30 @@ model Setting {
   value     String
   updatedAt DateTime @updatedAt
 }
+
+/// Server-side stored files backing the MIDDLEMAN direct links.
+/// A file row is created ONLY after the server has fully downloaded /
+/// merged / converted the media from YouTube. The direct link
+/// (/api/file/<token>) then serves the local file — the user's connection
+/// never touches YouTube. lookupKey is the request signature
+/// ("webpageUrl::format::bitrate") so re-hits and self-heals resolve to the
+/// SAME token (old copied links keep working across re-downloads).
+model StoredFile {
+  id            String   @id @default(cuid())
+  token         String   @unique
+  lookupKey     String   @unique
+  filename      String
+  filePath      String
+  sizeBytes     BigInt
+  mime          String
+  kind          String   @default("video") // video | audio
+  quality       String   @default("")
+  title         String   @default("")
+  webpageUrl    String   @default("")
+  formatSpec    String   @default("") // f param: itag | "v|a|container" | "mp3"…
+  downloadCount Int      @default(0)
+  createdAt     DateTime @default(now())
+  lastAccessAt  DateTime @default(now())
+
+  @@index([lastAccessAt])
+}

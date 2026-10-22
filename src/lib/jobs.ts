@@ -39,6 +39,7 @@ import {
   toolEnv,
 } from "./ytdlp";
 import { ffmpegProxyEnv } from "./proxy";
+import { registerStoredFile } from "./store";
 
 export type JobState = "queued" | "downloading" | "merging" | "ready" | "error" | "cancelled";
 
@@ -66,6 +67,14 @@ export interface Job {
   args?: string[]; // pending spawn args for queued jobs
   engine: "ytdlp" | "ffmpeg";
   durationSec: number; // for ffmpeg progress math
+  /** StoredFile lookupKey — set for direct-link jobs; finished files are
+   *  registered in the store (persistent, disk-only serving via token) */
+  dlKey?: string;
+  webpageUrl?: string;
+  qualityLabel?: string;
+  formatSpec?: string;
+  /** set once the finished file is registered in the store → /api/file/<token> */
+  directToken?: string;
 }
 
 declare global {
@@ -116,7 +125,9 @@ export function ensureCleanupTimer(): void {
             /* noop */
           }
         }
-        if (job.filePath && existsSync(job.filePath)) {
+        // registered files (direct links) are owned by the store's eviction —
+        // deleting them here would break links that are still being used
+        if (job.filePath && existsSync(job.filePath) && !job.dlKey) {
           try {
             rmSync(job.filePath, { force: true });
           } catch {
@@ -195,6 +206,10 @@ export interface CreateJobInput {
   duration?: number;
   /** direct stream URLs for urlmerge / urlaudio modes */
   urls?: { video?: string; audio?: string };
+  /** StoredFile lookupKey — direct-link jobs register their finished file */
+  dlKey?: string;
+  qualityLabel?: string;
+  formatSpec?: string;
 }
 
 export function sanitizeFilename(name: string): string {
@@ -412,12 +427,46 @@ export function createJob(input: CreateJobInput): Job {
     durationSec,
   };
 
-  jobStore().set(job.id, job);
+  const fullJob: Job = {
+    ...job,
+    dlKey: input.dlKey,
+    webpageUrl: input.webpageUrl || raw.webpage_url,
+    qualityLabel: input.qualityLabel,
+    formatSpec: input.videoFormatId || input.audioFormat,
+  };
+
+  jobStore().set(fullJob.id, fullJob);
   ensureCleanupTimer();
-  job.args = args;
+  fullJob.args = args;
   pump();
 
-  return job;
+  return fullJob;
+}
+
+/**
+ * Direct-link jobs: persist the finished file into the StoredFile registry
+ * (async, non-blocking). Once registered, /api/file/<token> serves the LOCAL
+ * file forever (until eviction) — that token is pinned onto the job so poll
+ * clients pick it up.
+ */
+function registerFinishedFile(job: Job): void {
+  if (!job.dlKey || !job.filePath) return;
+  void registerStoredFile({
+    lookupKey: job.dlKey,
+    filePath: job.filePath,
+    filename: job.filename,
+    mime: job.mime,
+    kind: job.mode === "mp3" ? "audio" : "video",
+    quality: job.qualityLabel,
+    title: job.title,
+    webpageUrl: job.webpageUrl,
+    formatSpec: job.formatSpec,
+  }).then((info) => {
+    if (info) {
+      job.directToken = info.token;
+      console.log(`[jobs] file registered → /api/file/${info.token} (${job.filename})`);
+    }
+  });
 }
 
 /* ---------------- progress parsing ---------------- */
@@ -473,6 +522,7 @@ async function attachYtdlpOutput(job: Job, proc: ChildProcess): Promise<void> {
         job.progress = 1;
         job.speed = null;
         job.eta = null;
+        registerFinishedFile(job);
       } else {
         job.state = "error";
         job.error = "INTERNAL";
@@ -541,6 +591,7 @@ async function attachFfmpegOutput(job: Job, proc: ChildProcess): Promise<void> {
         job.progress = 1;
         job.speed = null;
         job.eta = null;
+        registerFinishedFile(job);
       } else {
         job.state = "error";
         job.error = "INTERNAL";
@@ -570,6 +621,7 @@ export function publicJob(job: Job) {
     sizeBytes: job.sizeBytes,
     error: job.error,
     mode: job.mode,
+    directUrl: job.directToken ? `/api/file/${job.directToken}` : null,
   };
 }
 

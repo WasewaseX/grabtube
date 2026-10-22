@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createJob, jobStore, publicJob, ensureCleanupTimer, type CreateJobInput } from "@/lib/jobs";
 import { getInfo, type RawInfo, type YtRawFormat, DlError } from "@/lib/ytdlp";
 import { isProxySource } from "@/lib/extract";
+import { lookupKeyFor } from "@/lib/store";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -32,6 +33,7 @@ export async function POST(req: Request) {
     title?: string;
     webpageUrl?: string;
     duration?: number;
+    quality?: string;
   };
   try {
     body = await req.json();
@@ -71,7 +73,7 @@ function buildInput(
   infoId: string,
   raw: RawInfo,
   mode: "merge" | "mp3" | "file",
-  body: { videoFormatId?: string; bitrate?: number; audioFormat?: string; title?: string; webpageUrl?: string; duration?: number },
+  body: { videoFormatId?: string; bitrate?: number; audioFormat?: string; title?: string; webpageUrl?: string; duration?: number; quality?: string },
 ): CreateJobInput {
   const base: CreateJobInput = {
     infoId,
@@ -82,7 +84,21 @@ function buildInput(
     webpageUrl: body.webpageUrl || raw.webpage_url,
     title: body.title || raw.title,
     duration: body.duration || raw.duration,
+    qualityLabel: body.quality,
+    formatSpec: body.videoFormatId || body.audioFormat,
   };
+
+  // direct-link registration: in-app jobs land in the SAME StoredFile
+  // registry as /api/dl hits (same lookupKey → same stable token link)
+  const webpageUrl = base.webpageUrl || "";
+  const fmtSpec = body.videoFormatId || body.audioFormat || "";
+  if (/^https?:\/\//.test(webpageUrl) && fmtSpec) {
+    base.dlKey = lookupKeyFor(
+      webpageUrl,
+      fmtSpec,
+      mode === "mp3" ? body.bitrate : undefined,
+    );
+  }
 
   if (!isProxySource(raw)) return base;
 

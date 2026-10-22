@@ -34,10 +34,13 @@ export interface DownloadItem {
   speed: number; // bytes/sec
   error?: string;
   jobId?: string;
-  /** permanent self-contained direct link (/api/dl) — works in any browser
-   *  or download manager (IDM/aria2) WITHOUT visiting YouTube; the server
-   *  does the whole download and serves the file with Range/resume */
+  /** direct link for external download managers. Once the server-side file
+   *  is fully downloaded & stored this is the STABLE /api/file/<token> link
+   *  (serves the stored file with resume support, never YouTube); before
+   *  that it is the /api/dl resolve link (fetch-first → 503 until stored). */
   directLink?: string;
+  /** true once directLink points at the stable stored-file token */
+  directReady?: boolean;
   videoUrl?: string; // for history
   thumb?: string;
 }
@@ -51,6 +54,8 @@ export interface HistoryEntry {
   size: number;
   at: number;
   videoUrl: string;
+  /** stable stored-file link (/api/file/<token>) while it exists */
+  directUrl?: string;
 }
 
 const HISTORY_KEY = "tubegrab.history.v1";
@@ -104,11 +109,10 @@ function mimeForExt(ext: string): string {
 }
 
 /**
- * Build the PERMANENT self-contained direct link (/api/dl) for a selection.
- * The link encodes the video URL + format + quality + title; when any client
- * (browser, IDM, aria2, curl) hits it, the SERVER does the full YouTube
- * download/merge/convert and serves the finished file with Range support.
- * Survives restarts and session expiry — re-resolves on demand.
+ * Build the /api/dl resolve link for a selection (pre-store fallback).
+ * When a download manager (or browser) hits it, the SERVER downloads the
+ * file fully first (answering 503 + Retry-After meanwhile), then serves the
+ * finished file with Range/resume — the client never touches YouTube.
  */
 export function buildDlLink(
   fmt: PublicFormat,
@@ -263,6 +267,7 @@ export function useDownloader() {
         videoUrl?: string;
         thumb?: string;
         directUrl?: string; // native-download fallback for browsers without the File System Access API
+        storedDirectUrl?: string; // stable /api/file/<token> link once the file is stored server-side
       },
       expectedTotal: number,
       signal: AbortSignal,
@@ -450,6 +455,7 @@ export function useDownloader() {
         size: received,
         at: Date.now(),
         videoUrl: item.videoUrl || "",
+        directUrl: item.storedDirectUrl,
       });
       toast.success(t("downloadComplete"), { description: `${item.filename} · ${formatBytes(received)}` });
     },
@@ -458,27 +464,44 @@ export function useDownloader() {
 
   /* ---------------- job polling ---------------- */
 
+  interface JobPoll {
+    state: string;
+    phase: string;
+    progress: number;
+    speed: string | null;
+    receivedBytes: number;
+    sizeBytes: number | null;
+    error: string | null;
+    directUrl?: string | null;
+  }
+
   const pollJob = useCallback(
-    async (jobId: string, signal: AbortSignal) => {
+    async (itemId: string, jobId: string, signal: AbortSignal): Promise<JobPoll> => {
       for (;;) {
         if (signal.aborted) throw new DOMException("Aborted", "AbortError");
         await new Promise((r) => setTimeout(r, 700));
         const res = await fetch(`/api/jobs/${jobId}`, { signal });
         const json = await res.json();
         if (!res.ok || json.error) throw new Error(json?.error?.code || "NOT_FOUND");
-        const job = json.job as {
-          state: string;
-          phase: string;
-          progress: number;
-          speed: string | null;
-          receivedBytes: number;
-          sizeBytes: number | null;
-          error: string | null;
-        };
-        if (job.state === "ready") return job;
+        let job = json.job as JobPoll;
+        if (job.state === "ready") {
+          // the finished file is registered in the store right after "ready"
+          // — one extra poll picks up the stable token link if it raced us
+          if (!job.directUrl) {
+            await new Promise((r) => setTimeout(r, 900));
+            try {
+              const again = await fetch(`/api/jobs/${jobId}`, { signal });
+              const j2 = await again.json();
+              if (again.ok && j2?.job?.directUrl) job = j2.job as JobPoll;
+            } catch {
+              /* keep what we have */
+            }
+          }
+          return job;
+        }
         if (job.state === "error") throw new Error(job.error || "INTERNAL");
         if (job.state === "cancelled") throw new DOMException("Cancelled", "AbortError");
-        patchItem(jobId, {
+        patchItem(itemId, {
           state: job.state === "merging" ? "merging" : job.state === "downloading" ? "downloading" : "queued",
           received: job.receivedBytes,
           total: job.sizeBytes ?? 0,
@@ -548,6 +571,7 @@ export function useDownloader() {
               bitrate: isConversion ? overrideBitrate ?? 320 : undefined,
               title: infoData.title,
               webpageUrl: infoData.webpageUrl,
+              quality: fmt.quality || "",
             }),
             signal: ctrl.signal,
           });
@@ -555,7 +579,11 @@ export function useDownloader() {
           if (!res.ok || json.error) throw new Error(json?.error?.code || "INTERNAL");
           const job = json.job as { id: string; sizeBytes: number | null };
           patchItem(id, { jobId: job.id, state: "queued", total: job.sizeBytes || fmt.filesize || 0 }, true);
-          await pollJob(job.id, ctrl.signal);
+          const done = await pollJob(id, job.id, ctrl.signal);
+          // the file is now STORED server-side → swap in the stable token link
+          if (done.directUrl) {
+            patchItem(id, { directLink: done.directUrl, directReady: true }, true);
+          }
           const fileUrl = `/api/jobs/${job.id}/file`;
           await streamToDisk(
             id,
@@ -564,7 +592,7 @@ export function useDownloader() {
                 signal: ctrl.signal,
                 headers: range ? { Range: range } : undefined,
               }),
-            { ...shell, directUrl: fileUrl },
+            { ...shell, directUrl: fileUrl, storedDirectUrl: done.directUrl ?? undefined },
             fmt.filesize || 0,
             ctrl.signal,
           );
@@ -609,6 +637,138 @@ export function useDownloader() {
     setItems((prev) => prev.filter((it) => it.state !== "done" && it.state !== "cancelled" && it.state !== "error"));
   }, []);
 
+  /* ---------------- direct link (fetch-first) ---------------- */
+
+  /**
+   * "🔗 Direct link" — the file must be ON THE SERVER before a link is
+   * handed out. Ready file → copy the stable /api/file/<token> link
+   * instantly. Otherwise the server starts downloading it first and a
+   * tracking row appears in Downloads; the stable link shows up on that
+   * row (Copy direct link) the moment the file is stored.
+   */
+  const getDirectLink = useCallback(
+    async (fmt: PublicFormat, infoData: PublicInfo, overrideBitrate?: number) => {
+      const isConversion =
+        fmt.kind === "audio" &&
+        (fmt.id === "convert" || ["mp3", "flac", "wav"].includes(fmt.container));
+      const spec = {
+        url: infoData.webpageUrl,
+        format: isConversion ? fmt.container : fmt.id,
+        quality: fmt.quality || "",
+        bitrate: isConversion && fmt.container === "mp3" ? overrideBitrate ?? 320 : undefined,
+        title: infoData.title,
+      };
+      try {
+        const res = await fetch("/api/dl-resolve", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(spec),
+        });
+        const json = await res.json();
+        if (json.status === "ready" && json.directUrl) {
+          const abs = `${window.location.origin}${json.directUrl}`;
+          void navigator.clipboard?.writeText(abs).catch(() => undefined);
+          toast.success("Direct link copied", {
+            description: `Stored on the YouWee server (${formatBytes(json.sizeBytes || 0)}) — downloads from here with full resume support. Paste it in IDM, aria2 or any browser.`,
+          });
+          return;
+        }
+        if (json.status === "busy") {
+          const label = isConversion
+            ? fmt.container.toUpperCase()
+            : fmt.kind === "video"
+              ? `${fmt.quality} · ${fmt.container.toUpperCase()}`
+              : `${fmt.quality} · ${fmt.container.toUpperCase()}`;
+          const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          const ctrl = new AbortController();
+          controllers.current.set(id, ctrl);
+          setItems((prev) =>
+            [
+              {
+                id,
+                title: infoData.title,
+                label,
+                filename: `${infoData.title.slice(0, 80)} (${label}).${fmt.container}`,
+                ext: fmt.container,
+                state: "queued" as ItemState,
+                received: 0,
+                total: fmt.filesize || 0,
+                speed: 0,
+                jobId: json.jobId || undefined,
+                videoUrl: infoData.webpageUrl,
+                thumb: infoData.thumbnail,
+                directLink: buildDlLink(fmt, infoData, overrideBitrate),
+              },
+              ...prev,
+            ].slice(0, 12),
+          );
+          toast.info("Fetching on the server first…", {
+            description: "The file is being downloaded to YouWee's server at full speed. The direct link appears on the row below as soon as it's stored.",
+          });
+          try {
+            if (json.jobId) {
+              const done = await pollJob(id, json.jobId, ctrl.signal);
+              if (done.directUrl) {
+                patchItem(id, { state: "done", directLink: done.directUrl, directReady: true, total: done.sizeBytes ?? 0 }, true);
+                pushHistory({
+                  id: `${Date.now()}-${label}`,
+                  title: infoData.title,
+                  thumb: infoData.thumbnail || "",
+                  label,
+                  ext: fmt.container,
+                  size: done.sizeBytes ?? 0,
+                  at: Date.now(),
+                  videoUrl: infoData.webpageUrl,
+                  directUrl: done.directUrl,
+                });
+                toast.success("Direct link is ready", {
+                  description: "The file is stored on the server — grab it from the row below (Copy direct link).",
+                });
+              } else {
+                patchItem(id, { state: "done", total: done.sizeBytes ?? 0 }, true);
+              }
+            } else {
+              // warm-up still resolving (no job yet) → poll the resolver
+              for (;;) {
+                if (ctrl.signal.aborted) throw new DOMException("Aborted", "AbortError");
+                await new Promise((r) => setTimeout(r, 2500));
+                const r2 = await fetch("/api/dl-resolve", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify(spec),
+                  signal: ctrl.signal,
+                });
+                const j2 = await r2.json();
+                if (j2.status === "ready" && j2.directUrl) {
+                  patchItem(id, { state: "done", directLink: j2.directUrl, directReady: true, total: j2.sizeBytes ?? 0 }, true);
+                  toast.success("Direct link is ready", {
+                    description: "The file is stored on the server — grab it from the row below (Copy direct link).",
+                  });
+                  break;
+                }
+                if (j2.status === "failed") throw new Error(j2.code || "INTERNAL");
+              }
+            }
+          } catch (e) {
+            const err = e as Error & { name?: string };
+            if (err.name === "AbortError") patchItem(id, { state: "cancelled" }, true);
+            else {
+              patchItem(id, { state: "error", error: err.message }, true);
+              toast.error(t("downloadFailed"), { description: t(errorKey(err.message)) });
+            }
+          } finally {
+            controllers.current.delete(id);
+          }
+          return;
+        }
+        toast.error(t("downloadFailed"), { description: t(errorKey(json.code || "INTERNAL")) });
+      } catch {
+        toast.error(t("downloadFailed"), { description: "Network error" });
+      }
+    },
+    [patchItem, pollJob, pushHistory, t],
+  );
+
   return {
     url,
     setUrl,
@@ -621,6 +781,7 @@ export function useDownloader() {
     fetchInfo,
     reset,
     startDownload,
+    getDirectLink,
     cancelItem,
     removeItem,
     clearFinished,

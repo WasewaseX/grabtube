@@ -10,7 +10,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import "@/styles/youwee.css";
-import { useDownloader, buildDlLink, type DownloadItem } from "@/hooks/use-downloader";
+import { useDownloader, type DownloadItem } from "@/hooks/use-downloader";
 import { LangProvider } from "@/hooks/use-lang";
 import type { PublicFormat, PublicInfo } from "@/lib/ytdlp";
 
@@ -171,6 +171,9 @@ function Downloader() {
           onStart={(fmt, bitrate) => {
             void dl.startDownload(fmt, info, bitrate);
           }}
+          onDirectLink={(fmt, bitrate) => {
+            void dl.getDirectLink(fmt, info, bitrate);
+          }}
         />
       )}
 
@@ -197,6 +200,7 @@ interface VideoPanelProps {
   mp3Bitrate: number;
   setMp3Bitrate: (b: number) => void;
   onStart: (fmt: PublicFormat, bitrate?: number) => void;
+  onDirectLink: (fmt: PublicFormat, bitrate?: number) => void;
 }
 
 function VideoPanel(p: VideoPanelProps) {
@@ -379,16 +383,15 @@ function VideoPanel(p: VideoPanelProps) {
           onClick={() => {
             const fmt = p.audioMode ? audioChosen : chosen;
             if (!fmt) return;
-            const link = buildDlLink(fmt, info, p.audioFmt === "MP3" ? p.mp3Bitrate : undefined);
-            const abs = `${window.location.origin}${link}`;
-            void navigator.clipboard?.writeText(abs).catch(() => undefined);
-            toast.success("Direct link copied", {
-              description: "Paste it in any browser or download manager (IDM, aria2…) — the server downloads from YouTube and serves the file with resume support.",
-            });
+            p.onDirectLink(fmt, p.audioFmt === "MP3" ? p.mp3Bitrate : undefined);
           }}
         >
           🔗 Direct link
         </button>
+      </div>
+      <div className="hint" style={{ marginTop: 8, textAlign: "center" }}>
+        Direct link = the file downloaded to this server first, then you download it from here —
+        resumable, no YouTube involved. Works in IDM / aria2 / any browser.
       </div>
     </section>
   );
@@ -502,12 +505,18 @@ function JobRow({
             onClick={() => {
               const abs = `${window.location.origin}${it.directLink}`;
               void navigator.clipboard?.writeText(abs).catch(() => undefined);
-              toast.success("Direct link copied", {
-                description: "Works in any browser or download manager — the server fetches from YouTube and serves the file with resume.",
-              });
+              if (it.directReady) {
+                toast.success("Direct link copied", {
+                  description: "The file is stored on the YouWee server — this link downloads it from here with full resume support (IDM, aria2, any browser).",
+                });
+              } else {
+                toast.info("Fetch-first link copied", {
+                  description: "The server downloads the file first; your download manager will retry automatically and land on the finished file.",
+                });
+              }
             }}
           >
-            🔗 Copy direct link
+            🔗 {it.directReady ? "Copy direct link" : "Copy fetch link"}
           </button>
         )}
       </div>
@@ -701,7 +710,27 @@ function History({ onClose }: { onClose: () => void }) {
                 </div>
               </div>
               <div className="hist-actions">
-                <button className="x-btn" onClick={(e) => e.stopPropagation()}>
+                {h.directUrl && (
+                  <button
+                    className="x-btn"
+                    title="Copy direct link (stored on the server)"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      const abs = `${window.location.origin}${h.directUrl}`;
+                      void navigator.clipboard?.writeText(abs).catch(() => undefined);
+                      toast.success("Direct link copied", {
+                        description: "The stored file downloads from this server with full resume support.",
+                      });
+                    }}
+                  >
+                    🔗
+                  </button>
+                )}
+                <button
+                  className="x-btn"
+                  title="Fetch again"
+                  onClick={(e) => e.stopPropagation()}
+                >
                   ↻
                 </button>
               </div>

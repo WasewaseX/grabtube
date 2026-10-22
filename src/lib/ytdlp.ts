@@ -424,17 +424,37 @@ async function ensureVisitorData(): Promise<string | null> {
 
 // ---- Player-client chain ---------------------------------------------------
 
-const CLIENT_ORDER = ['mweb', 'tv', 'web_safari', 'web', 'ios']
+/**
+ * Probing through the WARP lane (2026.10) showed:
+ *   default (no player_client) → 40 video + 10 audio  ← FULL formats
+ *   tv_embedded                → 52 formats           ← strong fallback
+ *   web_embedded               → 39 formats           ← strong fallback
+ *   mweb                       → 1 format  (DEGRADED — accept only as last resort)
+ *   android / android_vr       → 1 format  (degraded)
+ *   tv / web / web_safari / ios→ bot-walled (ERROR)
+ * The first entry ("default") emits NO player_client arg: yt-dlp's own client
+ * selection + our PO-token providers yield the complete format map.
+ */
+const CLIENT_ORDER = ['default', 'tv_embedded', 'web_embedded', 'mweb']
+
+/** A client result must carry at least this many media formats to count as
+ *  healthy. Degraded single-format responses (mweb/android) are only accepted
+ *  after every healthier step failed. */
+const MIN_HEALTHY_FORMATS = 3
 
 /** Rotation steps; [0] is used by server-side jobs (jobs.ts) so it must always
- *  carry the freshest visitor_data. Mutated in place by refreshClientChain. */
-export const CLIENT_CHAIN: string[][] = CLIENT_ORDER.map((c) => [
-  '--extractor-args',
-  `youtube:player_client=${c}`,
-])
+ *  carry the freshest visitor_data. Mutated in place by refreshClientChain.
+ *  The 'default' step is an EMPTY arg list — no player_client override. */
+export const CLIENT_CHAIN: string[][] = CLIENT_ORDER.map((c) =>
+  c === 'default' ? [] : ['--extractor-args', `youtube:player_client=${c}`],
+)
 
 export function refreshClientChain(visitorData: string | null): void {
   for (let i = 0; i < CLIENT_ORDER.length; i++) {
+    if (CLIENT_ORDER[i] === 'default') {
+      CLIENT_CHAIN[i] = []
+      continue
+    }
     const val = visitorData
       ? `youtube:player_client=${CLIENT_ORDER[i]};visitor_data=${visitorData}`
       : `youtube:player_client=${CLIENT_ORDER[i]}`
@@ -556,6 +576,9 @@ export async function fetchInfo(url: string): Promise<{ infoId: string; raw: Raw
   let rotatedVisitor = false
   const errors: Classified[] = []
   const MAX_STEPS = 4
+  // keep the richest degraded response — if every step is unhealthy we still
+  // return it instead of erroring out (1-format info beats no info)
+  let bestRaw: RawInfo | null = null
 
   for (let i = 0; i < Math.min(MAX_STEPS, CLIENT_CHAIN.length); i++) {
     const step = CLIENT_CHAIN[i]
@@ -566,11 +589,17 @@ export async function fetchInfo(url: string): Promise<{ infoId: string; raw: Raw
     if (code === 0 && stdout.trim().startsWith('{')) {
       const raw = await parseRaw(stdout, clean)
       if (raw.is_live) throw new DlError('LIVE', 'Live streams cannot be downloaded.')
-      if (raw.formats.length > 0) {
+      if (raw.formats.length === 0) {
+        errors.push({ code: 'NO_FORMATS', message: 'Player returned no media formats.' })
+        continue
+      }
+      if (raw.formats.length >= MIN_HEALTHY_FORMATS) {
         const infoId = putInfo(raw)
         return { infoId, raw }
       }
-      errors.push({ code: 'NO_FORMATS', message: 'Player returned no media formats.' })
+      // degraded (e.g. mweb single-format responses) — remember and rotate on
+      if (!bestRaw || raw.formats.length > bestRaw.formats.length) bestRaw = raw
+      errors.push({ code: 'NO_FORMATS', message: 'Player returned a degraded format list.' })
       continue
     }
     const c = classifyStderr(stderr || 'empty output')
@@ -588,6 +617,10 @@ export async function fetchInfo(url: string): Promise<{ infoId: string; raw: Raw
     }
   }
 
+  if (bestRaw && bestRaw.formats.length > 0) {
+    const infoId = putInfo(bestRaw)
+    return { infoId, raw: bestRaw }
+  }
   const worst = errors.find((e) => e.code === 'BOT_CHECK') ?? errors[0] ?? { code: 'FETCH_FAILED' as const, message: 'Extraction failed.' }
   throw new DlError(worst.code, worst.message, worst.hint)
 }

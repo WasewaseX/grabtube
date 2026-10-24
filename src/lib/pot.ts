@@ -58,7 +58,9 @@ export async function ensurePotServer(): Promise<boolean> {
     child.on('error', () => { /* verified via health-ping below */ })
     child.unref()
     globalForPot.potChild = child
-    for (let i = 0; i < 20; i++) {
+    // first boot after a sandbox reset resolves deno deps cold (~1 min) —
+    // the ping window must outlive that or the server gets orphaned "offline"
+    for (let i = 0; i < 150; i++) {
       await new Promise(r => setTimeout(r, 500))
       if (await isPotServerUp()) return true
     }

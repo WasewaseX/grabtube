@@ -600,7 +600,7 @@ export async function fetchInfo(url: string): Promise<{ infoId: string; raw: Raw
   let rotatedVisitor = false
   const errors: Classified[] = []
   const MAX_STEPS = 4
-  const INFO_DEADLINE = Date.now() + 110_000 // overall budget for the client chain
+  const INFO_DEADLINE = Date.now() + 200_000 // overall budget for the client chain
   // keep the richest degraded response — if every step is unhealthy we still
   // return it instead of erroring out (1-format info beats no info)
   let bestRaw: RawInfo | null = null
@@ -608,9 +608,19 @@ export async function fetchInfo(url: string): Promise<{ infoId: string; raw: Raw
   for (let i = 0; i < Math.min(MAX_STEPS, CLIENT_CHAIN.length); i++) {
     if (Date.now() > INFO_DEADLINE) break // budget spent → let providers answer
     const step = CLIENT_CHAIN[i]
+    // step 0 is PATIENT: tunnel good-phases last a couple of minutes and the
+    // default client + PO tokens usually answers inside it. Later steps are
+    // fail-fast so the rotation reaches a healthy client quickly.
+    const patient = i === 0
     const { code, stdout, stderr } = await runYtDlp(
-      ['-J', ...infoArgs(), ...step, ...(cookies ? ['--cookies', cookies] : []), clean],
-      45000,
+      [
+        '-J',
+        ...(patient ? baseArgs() : infoArgs()),
+        ...step,
+        ...(cookies ? ['--cookies', cookies] : []),
+        clean,
+      ],
+      patient ? 75000 : 40000,
     )
     if (code === 0 && stdout.trim().startsWith('{')) {
       const raw = await parseRaw(stdout, clean)

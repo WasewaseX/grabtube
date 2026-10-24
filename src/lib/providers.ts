@@ -24,11 +24,20 @@ export interface Instance {
 }
 
 const BUILTIN: Instance[] = [
+  // Piped (github.com/TeamPiped/Piped — MIT) — official public instances
   { name: "piped.private.coffee", kind: "piped", base: "https://api.piped.private.coffee" },
   { name: "piped.adminforge", kind: "piped", base: "https://pipedapi.adminforge.de" },
   { name: "piped.kavin", kind: "piped", base: "https://pipedapi.kavin.rocks" },
+  { name: "piped.ducks.party", kind: "piped", base: "https://pipedapi.ducks.party" },
+  { name: "piped.reallyaweso.me", kind: "piped", base: "https://pipedapi.reallyaweso.me" },
+  { name: "piped.leptons.xyz", kind: "piped", base: "https://pipedapi.leptons.xyz" },
+  // Invidious (github.com/iv-org/invidious — GPL) — official public instances
   { name: "invidious.f5.si", kind: "invidious", base: "https://invidious.f5.si" },
   { name: "invidious.nadeko", kind: "invidious", base: "https://inv.nadeko.net" },
+  { name: "yewtu.be", kind: "invidious", base: "https://yewtu.be" },
+  { name: "invidious.nerdvpn.de", kind: "invidious", base: "https://invidious.nerdvpn.de" },
+  { name: "iv.melmac.space", kind: "invidious", base: "https://iv.melmac.space" },
+  { name: "invidious.privacyredirect", kind: "invidious", base: "https://invidious.privacyredirect.com" },
 ];
 
 export function instances(): Instance[] {

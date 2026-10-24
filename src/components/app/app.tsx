@@ -151,6 +151,9 @@ function Downloader() {
             {dl.phase === "loading" ? "Fetching…" : "Fetch"}
           </button>
         </div>
+        {dl.phase === "loading" && dl.pendingNote && (
+          <div className="alert info" role="status" aria-live="polite">{dl.pendingNote}</div>
+        )}
         {dl.phase === "error" && dl.errorMsg && <div className="alert err">{dl.errorMsg}</div>}
       </section>
 

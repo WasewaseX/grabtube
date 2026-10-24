@@ -142,6 +142,7 @@ export function useDownloader() {
 
   const [url, setUrl] = useState("");
   const [phase, setPhase] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [pendingNote, setPendingNote] = useState<string | null>(null);
   const [info, setInfo] = useState<PublicInfo | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [errorCode, setErrorCode] = useState<string | null>(null);
@@ -210,22 +211,68 @@ export function useDownloader() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ url: clean }),
-          // client-side bail-out: never depend on the gateway's timeout —
-          // the server's own extraction budget (~3 min worst case) fits
-          // inside this, so a real answer usually arrives first
-          signal: AbortSignal.timeout(170_000),
+          // the server answers within ~26 s: either the result or a 202
+          // "pending" that its background retry loop now owns
+          signal: AbortSignal.timeout(30_000),
         });
+        if (res.status === 202) {
+          // cobalt-style session: the server keeps retrying through tunnel
+          // phases — poll until done / failed / user gives up
+          const deadline = Date.now() + 12 * 60_000;
+          while (Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 4_000));
+            const pr = await fetch(`/api/info?u=${encodeURIComponent(clean)}`, {
+              signal: AbortSignal.timeout(10_000),
+            }).catch(() => null);
+            if (!pr) {
+              setPendingNote("Reconnecting…");
+              continue;
+            }
+            if (pr.status === 200) {
+              const json = await pr.json();
+              if (json?.info) {
+                setInfo(json.info as PublicInfo);
+                setPhase("ready");
+                setPendingNote(null);
+                return;
+              }
+              continue;
+            }
+            if (pr.status === 202) {
+              const j = await pr.json().catch(() => null);
+              const n = j?.attempts ?? 0;
+              setPendingNote(
+                n > 1 ? `Route busy — retry ${n} (the server keeps trying)` : "Waiting for a healthy route…",
+              );
+              continue;
+            }
+            const j = await pr.json().catch(() => null);
+            setPhase("error");
+            setPendingNote(null);
+            setErrorCode(j?.error?.code || "FETCH_FAILED");
+            setErrorMsg(j?.error?.message || "Failed");
+            return;
+          }
+          setPhase("error");
+          setPendingNote(null);
+          setErrorCode("TIMEOUT");
+          setErrorMsg("The engine could not reach YouTube in time — try again in a few minutes.");
+          return;
+        }
         const json = await res.json();
         if (!res.ok || json.error) {
           setPhase("error");
+          setPendingNote(null);
           setErrorCode(json?.error?.code || "FETCH_FAILED");
           setErrorMsg(json?.error?.message || "Failed");
           return;
         }
         setInfo(json.info as PublicInfo);
+        setPendingNote(null);
         setPhase("ready");
       } catch (e) {
         setPhase("error");
+        setPendingNote(null);
         setErrorCode("FETCH_FAILED");
         const aborted = e instanceof DOMException && e.name === "TimeoutError";
         setErrorMsg(
@@ -244,6 +291,7 @@ export function useDownloader() {
     setPhase("idle");
     setErrorMsg(null);
     setErrorCode(null);
+    setPendingNote(null);
   }, []);
 
   /* ---------------- sampler ---------------- */
@@ -782,6 +830,7 @@ export function useDownloader() {
     url,
     setUrl,
     phase,
+    pendingNote,
     info,
     errorMsg,
     errorCode,

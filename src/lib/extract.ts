@@ -8,7 +8,6 @@
  */
 import { DlError, fetchInfo, putInfo, toPublicInfo, type PublicInfo, type RawInfo } from "./ytdlp";
 import { fetchViaProxies, parseVideoId } from "./providers";
-import { activeLane, probeAll } from "./proxy";
 
 const TERMINAL = new Set(["PRIVATE", "UNAVAILABLE", "LIVE", "AGE_RESTRICTED", "UNSUPPORTED_URL"]);
 
@@ -34,16 +33,12 @@ export async function extract(url: string): Promise<{ infoId: string; info: Publ
     }
   };
 
-  /* ---------- 1. primary: yt-dlp (with one self-healing retry) ---------- */
+  /* ---------- 1. primary: yt-dlp (single pass) ---------- */
+  // NOTE: no internal retry here — the fetch-queue owns retry cycling now
+  // (shorter attempts = faster rotation through tunnel phases); legacy
+  // callers get one single-pass try then the community providers.
   const first = await attempt();
   if (first) return first;
-  if (errRef.current && (errRef.current.code === "BOT_CHECK" || errRef.current.code === "RATE_LIMITED")) {
-    const lane = activeLane();
-    if (lane.kind === "warp" || lane.kind === "user") {
-      const second = await attempt(); // tunnel recovered mid-request → retry
-      if (second) return second;
-    }
-  }
 
   /* ---------- 2. fallback: community proxy APIs ---------- */
   const videoId = parseVideoId(url);

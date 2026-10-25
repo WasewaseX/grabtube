@@ -60,6 +60,20 @@ export interface HistoryEntry {
 
 const HISTORY_KEY = "tubegrab.history.v1";
 
+/**
+ * Honest status ladder for the extraction poll. The server cycles through
+ * yt-dlp → Piped/Invidious mirrors → the community-mirror backend on every
+ * attempt; the copy reflects what actually happens at each stage instead of
+ * a vague "busy" line.
+ */
+function pendingStatus(attempts: number, elapsedMs: number): string {
+  if (attempts <= 1) return "Connecting to YouTube…";
+  if (attempts <= 3) return `YouTube is throttling this route — retrying (attempt ${attempts})…`;
+  if (elapsedMs > 180_000)
+    return `Still working — the mirror farm is preparing your file (attempt ${attempts})…`;
+  return `YouTube blocked us — community mirrors engaged (attempt ${attempts})…`;
+}
+
 /* ------------------------------------------------------------------ */
 /* File-system access helpers                                          */
 /* ------------------------------------------------------------------ */
@@ -241,9 +255,8 @@ export function useDownloader() {
             if (pr.status === 202) {
               const j = await pr.json().catch(() => null);
               const n = j?.attempts ?? 0;
-              setPendingNote(
-                n > 1 ? `Route busy — retry ${n} (the server keeps trying)` : "Waiting for a healthy route…",
-              );
+              const elapsed = j?.elapsedMs ?? 0;
+              setPendingNote(pendingStatus(n, elapsed));
               continue;
             }
             const j = await pr.json().catch(() => null);

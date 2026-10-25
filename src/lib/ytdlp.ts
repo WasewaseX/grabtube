@@ -139,6 +139,8 @@ export type DlErrorCode =
   | 'NO_FFMPEG'
   | 'DISK_FULL'
   | 'INTERNAL'
+  | 'MIRROR_TIMEOUT'
+  | 'MIRROR_FAILED'
 
 export class DlError extends Error {
   code: DlErrorCode
@@ -641,8 +643,13 @@ export async function fetchInfo(url: string): Promise<{ infoId: string; raw: Raw
     const c = classifyStderr(stderr || 'empty output')
     if (TERMINAL_CODES.has(c.code)) throw new DlError(c.code, c.message, c.hint)
     errors.push(c)
+    // IP-level bot walls answer the same on every player client — rotating
+    // clients/visitor ids cannot fix a flagged egress IP. Break out AT ONCE
+    // so the mirror layers (Piped/Invidious/savenow) answer; the fetch-queue
+    // re-attempts yt-dlp on later cycles when the tunnel phase rotates.
+    if (c.code === 'BOT_CHECK' || c.code === 'RATE_LIMITED') break
     // bot wall → rotate visitor identity exactly once and keep rotating clients
-    if ((c.code === 'BOT_CHECK' || c.code === 'RATE_LIMITED') && !rotatedVisitor) {
+    if (!rotatedVisitor) {
       rotatedVisitor = true
       const minted = await mintVisitorData()
       if (minted && minted !== visitor) {
@@ -752,13 +759,15 @@ function pickAudio(formats: YtRawFormat[], container: string): YtRawFormat | nul
 
 export function toPublicInfo(infoId: string, raw: RawInfo): PublicInfo {
   const isYT = /youtube/i.test(raw.extractor_key ?? '') || isYouTubeUrl(raw.webpage_url)
-  const source = /:piped/i.test(raw.extractor_key ?? '')
-    ? 'Piped'
-    : /:invidious/i.test(raw.extractor_key ?? '')
-      ? 'Invidious'
-      : isYT
-        ? 'youtube'
-        : 'other'
+  const source = /:savenow/i.test(raw.extractor_key ?? '')
+    ? 'Community mirror'
+    : /:piped/i.test(raw.extractor_key ?? '')
+      ? 'Piped'
+      : /:invidious/i.test(raw.extractor_key ?? '')
+        ? 'Invidious'
+        : isYT
+          ? 'youtube'
+          : 'other'
 
   const thumbProxy = (u?: string): string => {
     if (!u || !/^https?:\/\//.test(u)) return ''

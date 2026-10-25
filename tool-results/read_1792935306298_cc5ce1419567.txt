@@ -1,0 +1,823 @@
+     1→/**
+     2→ * Server-side download jobs — the MIDDLEMAN engine.
+     3→ *
+     4→ * The server (fast datacenter pipe + WARP egress) always downloads from
+     5→ * YouTube FIRST, at full speed. The user's browser/downloader then pulls the
+     6→ * finished file from this server with Range/resume support — YouTube is never
+     7→ * involved in the user's own connection (crucial for slow/censored networks).
+     8→ *
+     9→ *  • merge / mp3    – yt-dlp downloads the selected tracks (optionally merging
+    10→ *                     with ffmpeg) and reports --newline progress.
+    11→ *  • file           – yt-dlp downloads ONE format (muxed video or native
+    12→ *                     audio) server-side. Used for "instant" formats so the
+    13→ *                     user never live-streams from YouTube through the app.
+    14→ *  • urlmerge       – ffmpeg pulls the video+audio direct URLs itself and
+    15→ *                     stream-copies them into one container. Used when the
+    16→ *                     format list came from a proxy provider (Piped/Invidious).
+    17→ *  • urlaudio       – ffmpeg pulls an audio direct URL and converts to MP3.
+    18→ *  • urlfile        – ffmpeg pulls a single direct URL and remuxes to the
+    19→ *                     target container (proxy-source instant formats).
+    20→ *
+    21→ * Jobs write to a temp file while emitting live progress, then the client
+    22→ * streams the finished file from /api/jobs/[id]/file. Finished files are kept
+    23→ * for hours (touch-extended while actively being downloaded) so slow
+    24→ * connections can pause/resume and external managers can re-hit the link.
+    25→ */
+    26→import { spawn, type ChildProcess } from "child_process";
+    27→import { randomUUID } from "crypto";
+    28→import { existsSync, mkdirSync, statSync, rmSync, statfsSync, renameSync, copyFileSync } from "fs";
+    29→import { tmpdir } from "os";
+    30→import path from "path";
+    31→
+    32→import {
+    33→  DlError,
+    34→  baseArgs,
+    35→  getEngine,
+    36→  getInfo,
+    37→  classifyStderr,
+    38→  CLIENT_CHAIN,
+    39→  toolEnv,
+    40→} from "./ytdlp";
+    41→import { ffmpegProxyEnv, probeAll } from "./proxy";
+    42→import { registerStoredFile } from "./store";
+    43→
+    44→export type JobState = "queued" | "downloading" | "merging" | "ready" | "error" | "cancelled";
+    45→
+    46→export interface Job {
+    47→  id: string;
+    48→  title: string;
+    49→  filename: string;
+    50→  ext: string;
+    51→  mime: string;
+    52→  state: JobState;
+    53→  phase: "queue" | "download" | "merge" | "done";
+    54→  progress: number; // 0..1
+    55→  speed: string | null;
+    56→  eta: string | null;
+    57→  receivedBytes: number;
+    58→  sizeBytes: number | null;
+    59→  error: string | null;
+    60→  mode: "merge" | "mp3" | "urlmerge" | "urlaudio" | "file" | "urlfile";
+    61→  createdAt: number;
+    62→  filePath: string | null;
+    63→  proc: ChildProcess | null;
+    64→  /** last time a client pulled (or resumed) this job's file — keeps the
+    65→   *  cleanup away from files an external manager is still downloading */
+    66→  lastServeAt: number | null;
+    67→  args?: string[]; // pending spawn args for queued jobs
+    68→  engine: "ytdlp" | "ffmpeg";
+    69→  durationSec: number; // for ffmpeg progress math
+    70→  /** StoredFile lookupKey — set for direct-link jobs; finished files are
+    71→   *  registered in the store (persistent, disk-only serving via token) */
+    72→  dlKey?: string;
+    73→  webpageUrl?: string;
+    74→  qualityLabel?: string;
+    75→  formatSpec?: string;
+    76→  /** set once the finished file is registered in the store → /api/file/<token> */
+    77→  directToken?: string;
+    78→  /** transient-failure auto-retries used (self-healing, like real download
+    79→   *  managers: tunnel stalls / bot blips re-queue instead of dying) */
+    80→  retries?: number;
+    81→  /** args of the last spawn — kept so a retry can re-queue identically
+    82→   *  (yt-dlp then RESUMES the .part file instead of restarting) */
+    83→  lastArgs?: string[];
+    84→  /** last time the transfer made byte progress — the stall watchdog kills
+    85→   *  wedged processes (frozen sockets that never time out) so the retry
+    86→   *  resumes from the .part file */
+    87→  lastProgressAt?: number;
+    88→}
+    89→
+    90→declare global {
+    91→  var __tgJobs: Map<string, Job> | undefined;
+    92→  var __tgJobsCleanup: NodeJS.Timeout | undefined;
+    93→}
+    94→
+    95→export function jobStore(): Map<string, Job> {
+    96→  if (!globalThis.__tgJobs) globalThis.__tgJobs = new Map();
+    97→  return globalThis.__tgJobs;
+    98→}
+    99→
+   100→const MAX_CONCURRENT_JOBS = 2;
+   101→/** finished files stay grabbable for 6h — direct links keep working long
+   102→ *  after the download started (slow networks, IDM queued overnight…) */
+   103→const JOBS_TTL_MS = 6 * 60 * 60 * 1000;
+   104→/** a file served within this window is considered actively downloading */
+   105→const ACTIVE_SERVE_MS = 10 * 60 * 1000;
+   106→/** auto-retries for TRANSIENT failures (tunnel stall, bot-check blip, 5xx).
+   107→ *  Terminal errors (private/unavailable/age….) never retry. */
+   108→const MAX_JOB_RETRIES = 3;
+   109→const TERMINAL_JOB_CODES = new Set([
+   110→  "PRIVATE",
+   111→  "UNAVAILABLE",
+   112→  "LIVE",
+   113→  "AGE_RESTRICTED",
+   114→  "UNSUPPORTED_URL",
+   115→  "INVALID_URL",
+   116→  "EXPIRED",
+   117→  "DISK_FULL",
+   118→  "NO_FORMATS",
+   119→  "GEO_BLOCKED",
+   120→  "CANCELLED",
+   121→]);
+   122→
+   123→export function jobsDir(): string {
+   124→  const dir = path.join(tmpdir(), "tubegrab-jobs");
+   125→  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+   126→  return dir;
+   127→}
+   128→
+   129→/* ---------------- cleanup ---------------- */
+   130→export function ensureCleanupTimer(): void {
+   131→  if (globalThis.__tgJobsCleanup) return;
+   132→  globalThis.__tgJobsCleanup = setInterval(() => {
+   133→    const store = jobStore();
+   134→    const now = Date.now();
+   135→    for (const [id, job] of store) {
+   136→      const expired = now - job.createdAt > JOBS_TTL_MS;
+   137→      const dead =
+   138→        (job.state === "cancelled" || job.state === "error") && now - job.createdAt > 10 * 60 * 1000;
+   139→      // actively downloading server-side → never touch (a 2160p merge can
+   140→      // legitimately run past an hour; killing it corrupts the transfer)
+   141→      const running =
+   142→        (job.state === "downloading" || job.state === "merging") &&
+   143→        now - job.createdAt < 3 * 60 * 60 * 1000;
+   144→      // an external manager is mid-download of the finished file → keep it
+   145→      const servedRecently = job.lastServeAt != null && now - job.lastServeAt < ACTIVE_SERVE_MS;
+   146→      if ((expired && !running && !servedRecently) || dead) {
+   147→        if (job.proc) {
+   148→          try {
+   149→            job.proc.kill("SIGKILL");
+   150→          } catch {
+   151→            /* noop */
+   152→          }
+   153→        }
+   154→        // registered files (direct links) are owned by the store's eviction —
+   155→        // deleting them here would break links that are still being used
+   156→        if (job.filePath && existsSync(job.filePath) && !job.dlKey) {
+   157→          try {
+   158→            rmSync(job.filePath, { force: true });
+   159→          } catch {
+   160→            /* noop */
+   161→          }
+   162→        }
+   163→        store.delete(id);
+   164→      }
+   165→    }
+   166→  }, 60_000);
+   167→  globalThis.__tgJobsCleanup.unref();
+   168→}
+   169→
+   170→/* ---------------- stall watchdog ---------------- */
+   171→
+   172→/**
+   173→ * WEDGE KILLER — the one failure mode yt-dlp cannot self-heal: through a
+   174→ * lossy tunnel a fragment socket occasionally freezes in a read that never
+   175→ * trips the socket timeout (data trickles byte-wise). The process then sits
+   176→ * "downloading" forever with a frozen .part file. Real download managers
+   177→ * solve this with a stall watchdog: no byte progress for N minutes → kill
+   178→ * the process → the close handler re-queues the job (transient) and the
+   179→ * retry RESUMES from the .part file. Bytes already fetched are never lost.
+   180→ */
+   181→const STALL_KILL_MS = 4 * 60 * 1000; // no byte movement for 4 min → wedge
+   182→const HARD_CAP_MS = 60 * 60 * 1000; // 1h without finishing → re-queue
+   183→
+   184→function ensureStallWatchdog(): void {
+   185→  if (globalThis.__tgJobsWatchdog) return;
+   186→  globalThis.__tgJobsWatchdog = setInterval(() => {
+   187→    const now = Date.now();
+   188→    for (const job of jobStore().values()) {
+   189→      if (job.state !== "downloading" && job.state !== "merging") continue;
+   190→      const started = job.lastProgressAt ?? job.createdAt;
+   191→      const stalled = now - started > STALL_KILL_MS && (job.progress > 0 || job.receivedBytes > 0);
+   192→      const overCap = now - started > HARD_CAP_MS;
+   193→      if (!stalled && !overCap) continue;
+   194→      console.log(
+   195→        `[jobs] job ${job.id} watchdog: ${stalled ? "stalled" : "over cap"} — killing for resume-retry`,
+   196→      );
+   197→      job.lastProgressAt = now; // avoid double-fire while the close event lands
+   198→      try {
+   199→        job.proc?.kill("SIGKILL");
+   200→      } catch {
+   201→        /* noop */
+   202→      }
+   203→    }
+   204→  }, 30_000);
+   205→  globalThis.__tgJobsWatchdog.unref();
+   206→}
+   207→
+   208→declare global {
+   209→  var __tgJobsWatchdog: NodeJS.Timeout | undefined;
+   210→}
+   211→
+   212→/* ---------------- concurrency pump ---------------- */
+   213→function activeCount(): number {
+   214→  let active = 0;
+   215→  for (const job of jobStore().values()) {
+   216→    if (job.state === "downloading" || job.state === "merging") active++;
+   217→  }
+   218→  return active;
+   219→}
+   220→
+   221→function pump(): void {
+   222→  const store = jobStore();
+   223→  let active = activeCount();
+   224→  for (const job of store.values()) {
+   225→    if (active >= MAX_CONCURRENT_JOBS) break;
+   226→    if (job.state === "queued" && job.args) {
+   227→      const args = job.args;
+   228→      job.args = undefined;
+   229→      active++;
+   230→      if (job.engine === "ffmpeg") spawnFfmpegJob(job, args);
+   231→      else spawnYtdlpJob(job, args);
+   232→    }
+   233→  }
+   234→}
+   235→
+   236→function spawnYtdlpJob(job: Job, args: string[]): void {
+   237→  const engine = getEngine();
+   238→  job.lastArgs = args;
+   239→  job.lastProgressAt = Date.now();
+   240→  const proc = spawn(engine.cmd, [...engine.baseArgs, ...args], {
+   241→    stdio: ["ignore", "pipe", "pipe"],
+   242→    // deno (JS-challenge solver) + venv binaries must be on PATH or YouTube
+   243→    // answers with an image-only format list
+   244→    env: toolEnv(),
+   245→  });
+   246→  job.proc = proc;
+   247→  job.state = "downloading";
+   248→  job.phase = "download";
+   249→  void attachYtdlpOutput(job, proc);
+   250→}
+   251→
+   252→function spawnFfmpegJob(job: Job, args: string[]): void {
+   253→  job.lastArgs = args;
+   254→  job.lastProgressAt = Date.now();
+   255→  const proc = spawn("ffmpeg", ["-hide_banner", "-loglevel", "error", ...args], {
+   256→    stdio: ["ignore", "pipe", "pipe"],
+   257→    // tunnel ffmpeg's https inputs through the active egress lane
+   258→    // (googlevideo URLs are IP-locked to the lane that minted them)
+   259→    env: { ...process.env, ...ffmpegProxyEnv() },
+   260→  });
+   261→  job.proc = proc;
+   262→  job.state = "downloading";
+   263→  job.phase = "download";
+   264→  void attachFfmpegOutput(job, proc);
+   265→}
+   266→
+   267→/* ---------------- creation ---------------- */
+   268→
+   269→export interface CreateJobInput {
+   270→  infoId: string;
+   271→  mode: "merge" | "mp3" | "urlmerge" | "urlaudio" | "file" | "urlfile";
+   272→  videoFormatId?: string; // composite "videoId|audioId|container" for merge; single itag for file
+   273→  bitrate?: number;
+   274→  /** target container for audio-conversion jobs (mp3/m4a/opus/flac/wav) */
+   275→  audioFormat?: string;
+   276→  webpageUrl?: string;
+   277→  title?: string;
+   278→  duration?: number;
+   279→  /** direct stream URLs for urlmerge / urlaudio modes */
+   280→  urls?: { video?: string; audio?: string };
+   281→  /** StoredFile lookupKey — direct-link jobs register their finished file */
+   282→  dlKey?: string;
+   283→  qualityLabel?: string;
+   284→  formatSpec?: string;
+   285→}
+   286→
+   287→export function sanitizeFilename(name: string): string {
+   288→  return (
+   289→    name
+   290→      .replace(/[\\/:*?"<>|\u0000-\u001f]/g, " ")
+   291→      .replace(/\s+/g, " ")
+   292→      .trim()
+   293→      .slice(0, 90) || "video"
+   294→  );
+   295→}
+   296→
+   297→function mimeFor(ext: string): string {
+   298→  switch (ext) {
+   299→    case "mp4":
+   300→      return "video/mp4";
+   301→    case "webm":
+   302→      return "video/webm";
+   303→    case "mkv":
+   304→      return "video/x-matroska";
+   305→    case "m4a":
+   306→      return "audio/mp4";
+   307→    case "mp3":
+   308→      return "audio/mpeg";
+   309→    default:
+   310→      return "application/octet-stream";
+   311→  }
+   312→}
+   313→
+   314→export function createJob(input: CreateJobInput): Job {
+   315→  const entry = getInfo(input.infoId);
+   316→  if (!entry) throw new DlError("EXPIRED", "This video's session expired. Fetch it again.");
+   317→
+   318→  // disk pre-flight: merge jobs buffer video+audio in tmp before muxing — a
+   319→  // full disk otherwise surfaces as a cryptic ENOSPC error at 98% done
+   320→  try {
+   321→    const s = statfsSync(jobsDir());
+   322→    const freeBytes = s.bsize * s.bavail;
+   323→    if (freeBytes < 1.2 * 1024 * 1024 * 1024) {
+   324→      throw new DlError(
+   325→        "DISK_FULL",
+   326→        "Server disk is almost full — clear finished downloads (or old job files) and try again.",
+   327→      );
+   328→    }
+   329→  } catch (e) {
+   330→    if (e instanceof DlError) throw e;
+   331→    /* statfs unavailable — skip the guard */
+   332→  }
+   333→
+   334→  const raw = entry.raw;
+   335→  const title = sanitizeFilename(input.title || raw.title || "video");
+   336→  const durationSec = input.duration || raw.duration || 0;
+   337→
+   338→  const jobId = randomUUID();
+   339→  let ext: string;
+   340→  let args: string[];
+   341→  let engine: Job["engine"];
+   342→  let mode = input.mode;
+   343→
+   344→  if (mode === "mp3") {
+   345→    // mode "mp3" covers every audio conversion target (mp3/m4a/opus/flac/wav)
+   346→    const target = ["mp3", "m4a", "opus", "flac", "wav"].includes(input.audioFormat ?? "")
+   347→      ? (input.audioFormat as string)
+   348→      : "mp3";
+   349→    ext = target;
+   350→    engine = "ytdlp";
+   351→    const bitrate = [320, 192, 128].includes(input.bitrate || 0) ? input.bitrate : 320;
+   352→    args = [
+   353→      ...baseArgs(),
+   354→      // same client chain as extraction, or the job re-resolves on a different
+   355→      // player client and the selection breaks (format roulette)
+   356→      ...CLIENT_CHAIN[0],
+   357→      "--no-playlist",
+   358→      "--newline",
+   359→      "-N",
+   360→      "8",
+   361→      "-f",
+   362→      "bestaudio/best",
+   363→      "-x",
+   364→      "--audio-format",
+   365→      target,
+   366→      // lossless/pcm targets ignore quality; mp3 uses the chosen bitrate,
+   367→      // everything else re-encodes at the best sensible preset (0)
+   368→      "--audio-quality",
+   369→      target === "mp3" ? `${bitrate}K` : "0",
+   370→      "-o",
+   371→      path.join(jobsDir(), `${jobId}.%(ext)s`),
+   372→      input.webpageUrl || raw.webpage_url,
+   373→    ];
+   374→  } else if (mode === "file") {
+   375→    // single-format server-side download (muxed video / native audio) —
+   376→    // "instant" formats go through this too so the user NEVER live-streams
+   377→    // from YouTube through the app; they always pull a local, resumable file
+   378→    const fmtId = (input.videoFormatId || "").split("|")[0];
+   379→    if (!fmtId) throw new DlError("INVALID_URL", "Missing format id.");
+   380→    const stored = raw.formats.find((f) => f.format_id === fmtId);
+   381→    ext = (stored?.ext || "mp4").toLowerCase();
+   382→    engine = "ytdlp";
+   383→    args = [
+   384→      ...baseArgs(),
+   385→      ...CLIENT_CHAIN[0],
+   386→      "--no-playlist",
+   387→      "--newline",
+   388→      "-N",
+   389→      "8",
+   390→      "-f",
+   391→      `${fmtId}/best`,
+   392→      "-o",
+   393→      path.join(jobsDir(), `${jobId}.%(ext)s`),
+   394→      input.webpageUrl || raw.webpage_url,
+   395→    ];
+   396→  } else if (mode === "urlfile") {
+   397→    // proxy-provider single stream → ffmpeg remux into the target container
+   398→    if (!input.urls?.video) throw new DlError("INVALID_URL", "Missing stream URL.");
+   399→    const fmtId = (input.videoFormatId || "").split("|")[0];
+   400→    const stored = raw.formats.find((f) => f.format_id === fmtId);
+   401→    ext = (stored?.ext || "mp4").toLowerCase();
+   402→    engine = "ffmpeg";
+   403→    const out = path.join(jobsDir(), `${randomUUID()}.${ext}`);
+   404→    const isMp4 = ext === "mp4";
+   405→    args = [
+   406→      "-y",
+   407→      "-i",
+   408→      input.urls.video,
+   409→      "-c",
+   410→      "copy",
+   411→      ...(isMp4 ? ["-movflags", "+faststart"] : []),
+   412→      "-progress",
+   413→      "pipe:1",
+   414→      out,
+   415→    ];
+   416→  } else if (mode === "urlaudio") {
+   417→    if (!input.urls?.audio) throw new DlError("INVALID_URL", "Missing audio stream URL.");
+   418→    ext = "mp3";
+   419→    engine = "ffmpeg";
+   420→    const bitrate = [320, 192, 128].includes(input.bitrate || 0) ? input.bitrate : 192;
+   421→    const out = path.join(jobsDir(), `${randomUUID()}.mp3`);
+   422→    args = ["-y", "-i", input.urls.audio, "-vn", "-c:a", "libmp3lame", "-b:a", `${bitrate}K`, "-progress", "pipe:1", out];
+   423→  } else if (mode === "urlmerge") {
+   424→    if (!input.urls?.video || !input.urls?.audio)
+   425→      throw new DlError("INVALID_URL", "Missing stream URLs for merge.");
+   426→    const [vId, aId, container] = (input.videoFormatId || "").split("|");
+   427→    ext = ["mp4", "webm", "mkv"].includes(container) ? container : "mkv";
+   428→    engine = "ffmpeg";
+   429→    const out = path.join(jobsDir(), `${randomUUID()}.${ext}`);
+   430→    const isMp4 = ext === "mp4";
+   431→    args = [
+   432→      "-y",
+   433→      "-i",
+   434→      input.urls.video,
+   435→      "-i",
+   436→      input.urls.audio,
+   437→      "-c",
+   438→      "copy",
+   439→      ...(isMp4 ? ["-movflags", "+faststart"] : []),
+   440→      "-progress",
+   441→      "pipe:1",
+   442→      out,
+   443→    ];
+   444→    void vId;
+   445→    void aId;
+   446→  } else {
+   447→    /* mode === "merge" (yt-dlp) */
+   448→    const [vId, aId, container] = (input.videoFormatId || "").split("|");
+   449→    if (!vId || !aId || !container) throw new DlError("INVALID_URL", "Bad merge request.");
+   450→    ext = ["mp4", "webm", "mkv"].includes(container) ? container : "mkv";
+   451→    engine = "ytdlp";
+   452→    const tmpPath = path.join(jobsDir(), `${jobId}.%(ext)s`);
+   453→    // resilient selector: the exact itags first, then quality-matched
+   454→    // fallbacks — yt-dlp's client roulette means the same itag may not exist
+   455→    // on the client that answers the job's own re-resolve
+   456→    const vf = raw.formats.find((f) => f.format_id === vId);
+   457→    const h = vf?.height;
+   458→    const fps = vf?.fps;
+   459→    const qualityFallback = h
+   460→      ? `bestvideo[height<=${h}${fps ? `][fps<=${fps}` : ""}]+bestaudio/bestvideo[height<=${h}]+bestaudio`
+   461→      : "bestvideo+bestaudio";
+   462→    args = [
+   463→      ...baseArgs(),
+   464→      ...CLIENT_CHAIN[0],
+   465→      "--no-playlist",
+   466→      "--newline",
+   467→      "-N",
+   468→      "8",
+   469→      "-f",
+   470→      `${vId}+${aId}/${qualityFallback}/bestvideo+bestaudio/best`,
+   471→      "--merge-output-format",
+   472→      ext,
+   473→      "-o",
+   474→      tmpPath,
+   475→      input.webpageUrl || raw.webpage_url,
+   476→    ];
+   477→  }
+   478→
+   479→  const job: Job = {
+   480→    id: jobId,
+   481→    title,
+   482→    filename: `${title}.${ext}`,
+   483→    ext,
+   484→    mime: mimeFor(ext),
+   485→    state: "queued",
+   486→    phase: "queue",
+   487→    progress: 0,
+   488→    speed: null,
+   489→    eta: null,
+   490→    receivedBytes: 0,
+   491→    sizeBytes: null,
+   492→    error: null,
+   493→    mode,
+   494→    createdAt: Date.now(),
+   495→    filePath: null,
+   496→    proc: null,
+   497→    lastServeAt: null,
+   498→    engine,
+   499→    durationSec,
+   500→  };
+   501→
+   502→  const fullJob: Job = {
+   503→    ...job,
+   504→    dlKey: input.dlKey,
+   505→    webpageUrl: input.webpageUrl || raw.webpage_url,
+   506→    qualityLabel: input.qualityLabel,
+   507→    formatSpec: input.videoFormatId || input.audioFormat,
+   508→  };
+   509→
+   510→  jobStore().set(fullJob.id, fullJob);
+   511→  ensureCleanupTimer();
+   512→  ensureStallWatchdog();
+   513→  fullJob.args = args;
+   514→  pump();
+   515→
+   516→  return fullJob;
+   517→}
+   518→
+   519→/**
+   520→ * Direct-link jobs: persist the finished file into the StoredFile registry
+   521→ * (async, non-blocking). Once registered, /api/file/<token> serves the LOCAL
+   522→ * file forever (until eviction) — that token is pinned onto the job so poll
+   523→ * clients pick it up.
+   524→ *
+   525→ * The finished file is FIRST moved out of /tmp (tmp cleaners would break
+   526→ * every stored link at once) into the durable downloads/ directory — the
+   527→ * "database" the direct links point at. Only then is it registered.
+   528→ */
+   529→function persistentDownloadsPath(filename: string): string {
+   530→  const dir = "/home/z/my-project/downloads";
+   531→  try {
+   532→    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+   533→  } catch {
+   534→    return path.join(jobsDir(), filename); // fall back to the tmp location
+   535→  }
+   536→  let target = path.join(dir, filename);
+   537→  const ext = path.extname(filename);
+   538→  const base = filename.slice(0, filename.length - ext.length);
+   539→  for (let i = 2; existsSync(target); i++) {
+   540→    target = path.join(dir, `${base} (${i})${ext}`);
+   541→  }
+   542→  return target;
+   543→}
+   544→
+   545→function moveIntoDownloads(job: Job): void {
+   546→  if (!job.filePath || !existsSync(job.filePath)) return;
+   547→  const target = persistentDownloadsPath(job.filename);
+   548→  if (target === job.filePath) return;
+   549→  try {
+   550→    try {
+   551→      renameSync(job.filePath, target); // fast path: same filesystem
+   552→    } catch {
+   553→      // cross-device (different mount) → copy + delete
+   554→      copyFileSync(job.filePath, target);
+   555→      rmSync(job.filePath, { force: true });
+   556→    }
+   557→    job.filePath = target;
+   558→  } catch {
+   559→    /* move failed — register the tmp file anyway; self-heal re-fetches */
+   560→  }
+   561→}
+   562→
+   563→function registerFinishedFile(job: Job): void {
+   564→  if (!job.dlKey || !job.filePath) return;
+   565→  moveIntoDownloads(job);
+   566→  void registerStoredFile({
+   567→    lookupKey: job.dlKey,
+   568→    filePath: job.filePath,
+   569→    filename: job.filename,
+   570→    mime: job.mime,
+   571→    kind: job.mode === "mp3" ? "audio" : "video",
+   572→    quality: job.qualityLabel,
+   573→    title: job.title,
+   574→    webpageUrl: job.webpageUrl,
+   575→    formatSpec: job.formatSpec,
+   576→  }).then((info) => {
+   577→    if (info) {
+   578→      job.directToken = info.token;
+   579→      console.log(`[jobs] file registered → /api/file/${info.token} (${job.filename})`);
+   580→    }
+   581→  });
+   582→}
+   583→
+   584→/* ---------------- self-healing retry ---------------- */
+   585→
+   586→/**
+   587→ * Re-queue a job that died from a TRANSIENT error. The egress lane is
+   588→ * re-probed first (a recovered tunnel gets picked for the retry) and yt-dlp
+   589→ * resumes the .part file it already wrote — no bytes re-downloaded.
+   590→ * Terminal errors (private video, age gate, bad URL…) never retry.
+   591→ */
+   592→function scheduleJobRetry(job: Job, errCode: string): boolean {
+   593→  if (TERMINAL_JOB_CODES.has(errCode)) return false;
+   594→  if ((job.retries ?? 0) >= MAX_JOB_RETRIES) return false;
+   595→  if (!job.lastArgs || job.lastArgs.length === 0) return false;
+   596→  job.retries = (job.retries ?? 0) + 1;
+   597→  job.state = "queued";
+   598→  job.phase = "queue";
+   599→  job.progress = 0;
+   600→  job.error = null;
+   601→  job.speed = null;
+   602→  job.eta = null;
+   603→  job.createdAt = Date.now(); // reset the TTL clock for the new attempt
+   604→  console.log(
+   605→    `[jobs] job ${job.id} transient failure (${errCode}) — retry ${job.retries}/${MAX_JOB_RETRIES}`,
+   606→  );
+   607→  const delay = 4_000 * job.retries;
+   608→  setTimeout(() => {
+   609→    // re-probe lanes so a recovered tunnel is active before the retry spawns
+   610→    void probeAll().finally(() => {
+   611→      job.args = job.lastArgs;
+   612→      pump();
+   613→    });
+   614→  }, delay);
+   615→  return true;
+   616→}
+   617→
+   618→/* ---------------- progress parsing ---------------- */
+   619→
+   620→async function attachYtdlpOutput(job: Job, proc: ChildProcess): Promise<void> {
+   621→  let stderr = "";
+   622→
+   623→  proc.stdout?.on("data", (chunk: Buffer) => {
+   624→    for (const line of chunk.toString().split("\n")) {
+   625→      const pct = line.match(/\[download\]\s+([\d.]+)%/);
+   626→      if (pct) {
+   627→        job.state = "downloading";
+   628→        job.phase = "download";
+   629→        job.lastProgressAt = Date.now();
+   630→        job.progress = Math.min(0.97, parseFloat(pct[1]) / 100);
+   631→        const spd = line.match(/at\s+([\d.]+\w*\/s)/);
+   632→        if (spd) job.speed = spd[1];
+   633→        const eta = line.match(/ETA\s+([\d:]+)/);
+   634→        if (eta) job.eta = eta[1];
+   635→      }
+   636→      if (line.includes("[Merger]") || line.includes("[ExtractAudio]")) {
+   637→        job.state = "merging";
+   638→        job.phase = "merge";
+   639→        job.progress = 0.985;
+   640→      }
+   641→    }
+   642→  });
+   643→
+   644→  proc.stderr?.on("data", (chunk: Buffer) => {
+   645→    stderr += chunk.toString();
+   646→    if (stderr.length > 32_000) stderr = stderr.slice(-16_000);
+   647→  });
+   648→
+   649→  proc.on("error", () => {
+   650→    if (job.state === "cancelled") return;
+   651→    job.state = "error";
+   652→    job.error = "INTERNAL";
+   653→    pump();
+   654→  });
+   655→
+   656→  proc.on("close", (code) => {
+   657→    if (job.state === "cancelled") return;
+   658→    if (code === 0) {
+   659→      const candidates = [job.ext, "mp4", "webm", "mkv", "m4a", "mp3"].map((e) =>
+   660→        path.join(jobsDir(), `${job.id}.${e}`),
+   661→      );
+   662→      // yt-dlp output templates used a random uuid (not job.id) → scan by ext
+   663→      const found = candidates.find((c) => existsSync(c));
+   664→      if (found) {
+   665→        job.filePath = found;
+   666→        job.sizeBytes = statSync(found).size;
+   667→        job.state = "ready";
+   668→        job.phase = "done";
+   669→        job.progress = 1;
+   670→        job.speed = null;
+   671→        job.eta = null;
+   672→        registerFinishedFile(job);
+   673→      } else {
+   674→        job.state = "error";
+   675→        job.error = "INTERNAL";
+   676→      }
+   677→    } else {
+   678→      const err = classifyStderr(stderr);
+   679→      if (scheduleJobRetry(job, err.code)) {
+   680→        pump();
+   681→        return;
+   682→      }
+   683→      job.state = "error";
+   684→      job.error = err.code;
+   685→      console.error(`[jobs] yt-dlp job ${job.id} failed (${err.code}): ${stderr.slice(-400).replace(/\n/g, " | ")}`);
+   686→    }
+   687→    pump();
+   688→  });
+   689→}
+   690→
+   691→async function attachFfmpegOutput(job: Job, proc: ChildProcess): Promise<void> {
+   692→  let stderr = "";
+   693→
+   694→  proc.stdout?.on("data", (chunk: Buffer) => {
+   695→    // ffmpeg -progress pipe:1 emits key=value lines
+   696→    for (const line of chunk.toString().split("\n")) {
+   697→      const m = line.match(/out_time_us=(\d+)/) || line.match(/out_time_ms=(\d+)/);
+   698→      if (m && job.durationSec > 0) {
+   699→        const done = parseInt(m[1], 10) / 1_000_000;
+   700→        job.lastProgressAt = Date.now();
+   701→        job.progress = Math.min(0.98, done / job.durationSec);
+   702→        job.state = job.progress >= 0.98 ? "merging" : "downloading";
+   703→        job.phase = job.progress >= 0.98 ? "merge" : "download";
+   704→      }
+   705→      const spd = line.match(/speed=\s*([\d.]+)x/);
+   706→      if (spd) {
+   707→        const x = parseFloat(spd[1]);
+   708→        if (x > 0) job.speed = `${x.toFixed(1)}×`;
+   709→      }
+   710→      const sz = line.match(/total_size=(\d+)/);
+   711→      if (sz) job.receivedBytes = parseInt(sz[1], 10);
+   712→      const rem = line.match(/out_time=(\S+)/);
+   713→      if (rem && job.durationSec > 0) {
+   714→        const parts = rem[1].split(":").map(parseFloat);
+   715→        const done = parts.length === 3 ? parts[0] * 3600 + parts[1] * 60 + parts[2] : 0;
+   716→        const left = Math.max(0, Math.round(job.durationSec - done));
+   717→        job.eta = left >= 1 ? `${left}s` : "0s";
+   718→      }
+   719→    }
+   720→  });
+   721→
+   722→  proc.stderr?.on("data", (chunk: Buffer) => {
+   723→    stderr += chunk.toString();
+   724→    if (stderr.length > 32_000) stderr = stderr.slice(-16_000);
+   725→  });
+   726→
+   727→  proc.on("error", () => {
+   728→    if (job.state === "cancelled") return;
+   729→    job.state = "error";
+   730→    job.error = "INTERNAL";
+   731→    pump();
+   732→  });
+   733→
+   734→  proc.on("close", (code) => {
+   735→    if (job.state === "cancelled") return;
+   736→    if (code === 0) {
+   737→      const found = path.join(jobsDir(), `${job.id}.${job.ext}`);
+   738→      if (existsSync(found)) {
+   739→        job.filePath = found;
+   740→        job.sizeBytes = statSync(found).size;
+   741→        job.state = "ready";
+   742→        job.phase = "done";
+   743→        job.progress = 1;
+   744→        job.speed = null;
+   745→        job.eta = null;
+   746→        registerFinishedFile(job);
+   747→      } else {
+   748→        job.state = "error";
+   749→        job.error = "INTERNAL";
+   750→      }
+   751→    } else {
+   752→      const errCode = /403|401/.test(stderr) ? "EXPIRED" : "FETCH_FAILED";
+   753→      if (scheduleJobRetry(job, errCode)) {
+   754→        pump();
+   755→        return;
+   756→      }
+   757→      job.state = "error";
+   758→      job.error = errCode;
+   759→    }
+   760→    pump();
+   761→  });
+   762→}
+   763→
+   764→/* ---------------- queries ---------------- */
+   765→
+   766→export function publicJob(job: Job) {
+   767→  return {
+   768→    id: job.id,
+   769→    title: job.title,
+   770→    filename: job.filename,
+   771→    ext: job.ext,
+   772→    state: job.state,
+   773→    phase: job.phase,
+   774→    progress: job.progress,
+   775→    speed: job.speed,
+   776→    eta: job.eta,
+   777→    receivedBytes: job.receivedBytes,
+   778→    sizeBytes: job.sizeBytes,
+   779→    error: job.error,
+   780→    mode: job.mode,
+   781→    directUrl: job.directToken ? `/api/file/${job.directToken}` : null,
+   782→  };
+   783→}
+   784→
+   785→export function cancelJob(id: string): boolean {
+   786→  const job = jobStore().get(id);
+   787→  if (!job) return false;
+   788→  if (job.proc) {
+   789→    try {
+   790→      job.proc.kill("SIGKILL");
+   791→    } catch {
+   792→      /* noop */
+   793→    }
+   794→  }
+   795→  job.state = "cancelled";
+   796→  if (job.filePath && existsSync(job.filePath)) {
+   797→    try {
+   798→      rmSync(job.filePath, { force: true });
+   799→    } catch {
+   800→      /* noop */
+   801→    }
+   802→  }
+   803→  pump();
+   804→  return true;
+   805→}
+   806→
+   807→export function jobFilePath(id: string): { path: string; job: Job } | null {
+   808→  const job = jobStore().get(id);
+   809→  if (!job || job.state !== "ready" || !job.filePath || !existsSync(job.filePath)) return null;
+   810→  return { path: job.filePath, job };
+   811→}
+   812→
+   813→/**
+   814→ * Touch the job's serve timestamp. Files are NO LONGER deleted shortly after
+   815→ * serving — external download managers on slow networks may take hours and
+   816→ * resume with Range requests; deleting under them breaks the transfer.
+   817→ * The TTL cleaner removes files hours later (extend-aware, see cleanup).
+   818→ */
+   819→export function markServed(id: string): void {
+   820→  const job = jobStore().get(id);
+   821→  if (job) job.lastServeAt = Date.now();
+   822→}
+   823→

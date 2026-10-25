@@ -18,8 +18,11 @@
 import { existsSync, statSync, createReadStream } from "fs";
 import { Readable } from "stream";
 
-import { fetchInfo, getInfo, type RawInfo } from "@/lib/ytdlp";
+import { getInfo, type RawInfo } from "@/lib/ytdlp";
+import { ensureRawInfo } from "@/lib/extract";
 import { createJob, jobStore, sanitizeFilename, type Job } from "@/lib/jobs";
+import { isSavenowSource, SAVENOW_QUALITIES, savenowPlaceholder } from "@/lib/savenow";
+import { parseVideoId } from "@/lib/providers";
 import { MIME_MAP, contentDisposition } from "@/lib/http-utils";
 import {
   findStoredByLookupKey,
@@ -87,7 +90,8 @@ async function resolveStorageKey(spec: LinkSpec): Promise<string> {
   }
 }
 
-/** webpage URL → RawInfo via the shared info store (re-extracts when cold). */
+/** webpage URL → RawInfo through the FULL extraction chain (yt-dlp →
+ *  Piped/Invidious fleet → savenow mirror), re-extracting when cold. */
 export async function loadRawInfo(webpageUrl: string): Promise<{ infoId: string; raw: RawInfo }> {
   const cache = infoCache();
   const hit = cache.get(webpageUrl);
@@ -95,7 +99,7 @@ export async function loadRawInfo(webpageUrl: string): Promise<{ infoId: string;
     const entry = getInfo(hit.infoId);
     if (entry) return { infoId: hit.infoId, raw: entry.raw };
   }
-  const fresh = await fetchInfo(webpageUrl);
+  const fresh = await ensureRawInfo(webpageUrl);
   cache.set(webpageUrl, { infoId: fresh.infoId, at: Date.now() });
   return fresh;
 }
@@ -115,6 +119,15 @@ export function filenameForSpec(spec: LinkSpec, raw: RawInfo): string {
   const title = sanitizeFilename(spec.title || raw.title || "video");
   const q = spec.quality ? ` (${spec.quality})` : "";
   return sanitizeFilename(`${title}${q}.${ext}`);
+}
+
+/** Nearest savenow quality for a requested pixel height. */
+function nearestSavenowQuality(height: number | undefined): string {
+  if (!height) return "360";
+  const ranked = [...SAVENOW_QUALITIES]
+    .map((q) => ({ q, h: q === "4k" ? 2160 : parseInt(q, 10) || 0 }))
+    .sort((a, b) => Math.abs(a.h - height) - Math.abs(b.h - height));
+  return ranked[0]?.q || "360";
 }
 
 /**
@@ -138,10 +151,37 @@ function warmUp(key: string, spec: LinkSpec): void {
     try {
       const { infoId, raw } = await loadRawInfo(spec.webpageUrl);
       const isAudio = AUDIO_TARGETS.has(spec.format.toLowerCase());
+      const mirror = isSavenowSource(raw);
       const filename = filenameForSpec(spec, raw);
+
+      let mode: Job["mode"] = isAudio ? "mp3" : spec.format.includes("|") ? "merge" : "file";
+      let urls: { video?: string; audio?: string } | undefined;
+      if (mirror) {
+        // savenow source: yt-dlp can't run (that's WHY we're on the mirror) —
+        // route to ffmpeg jobs that resolve the placeholder at spawn time
+        const videoId = raw.id || parseVideoId(raw.webpage_url) || "";
+        if (isAudio) {
+          mode = "urlaudio";
+          urls = { audio: savenowPlaceholder(videoId, "mp3") };
+        } else {
+          mode = "urlfile";
+          const fmtId = spec.format.split("|")[0];
+          const stored = raw.formats.find((f) => f.format_id === fmtId);
+          const height =
+            stored?.height ??
+            (parseInt(spec.quality || "", 10) || null);
+          urls = {
+            video:
+              stored?.url && /savenow:\/\//.test(stored.url)
+                ? stored.url
+                : savenowPlaceholder(videoId, nearestSavenowQuality(height ?? undefined)),
+          };
+        }
+      }
+
       const job = createJob({
         infoId,
-        mode: isAudio ? "mp3" : spec.format.includes("|") ? "merge" : "file",
+        mode,
         videoFormatId: isAudio ? undefined : spec.format,
         audioFormat: isAudio ? spec.format.toLowerCase() : undefined,
         bitrate: spec.bitrate,
@@ -154,9 +194,10 @@ function warmUp(key: string, spec: LinkSpec): void {
         ),
         duration: raw.duration,
         dlKey: key,
+        urls,
       });
       registry.set(key, { jobId: job.id });
-      console.log(`[link] job ${job.id} started for ${filename}`);
+      console.log(`[link] job ${job.id} started for ${filename}${mirror ? " (mirror)" : ""}`);
     } catch (e) {
       const code = (e as { code?: string }).code || "FETCH_FAILED";
       registry.set(key, {

@@ -40,6 +40,7 @@ import {
 } from "./ytdlp";
 import { ffmpegProxyEnv, probeAll } from "./proxy";
 import { registerStoredFile } from "./store";
+import { parseSavenowPlaceholder, resolveSavenowUrl } from "./savenow";
 
 export type JobState = "queued" | "downloading" | "merging" | "ready" | "error" | "cancelled";
 
@@ -85,6 +86,15 @@ export interface Job {
    *  wedged processes (frozen sockets that never time out) so the retry
    *  resumes from the .part file */
   lastProgressAt?: number;
+  /** lazy spawn-args builder — provider formats whose real URL only exists
+   *  after an async resolution step (savenow community mirror) resolve at
+   *  pump time instead of creation time */
+  argsBuilder?: () => Promise<string[] | null>;
+  /** resolver/spawn currently running for a builder job (anti double-fire) */
+  resolving?: boolean;
+  /** true when every input URL is provider-hosted (savenow CDN) — no WARP
+   *  proxying needed for ffmpeg; direct egress is faster and not IP-locked */
+  plainEgress?: boolean;
 }
 
 declare global {
@@ -223,12 +233,39 @@ function pump(): void {
   let active = activeCount();
   for (const job of store.values()) {
     if (active >= MAX_CONCURRENT_JOBS) break;
-    if (job.state === "queued" && job.args) {
+    if (job.state !== "queued") continue;
+    if (job.args) {
       const args = job.args;
       job.args = undefined;
       active++;
       if (job.engine === "ffmpeg") spawnFfmpegJob(job, args);
       else spawnYtdlpJob(job, args);
+    } else if (job.argsBuilder && !job.resolving) {
+      // lazy URL resolution (community-mirror formats) — async pre-spawn step
+      job.resolving = true;
+      job.lastProgressAt = Date.now();
+      void job
+        .argsBuilder()
+        .then((built) => {
+          job.resolving = false;
+          if (built && built.length > 0) {
+            job.args = built;
+          } else {
+            job.state = "error";
+            job.error = "MIRROR_FAILED";
+            console.error(`[jobs] job ${job.id} mirror resolution returned nothing`);
+          }
+        })
+        .catch((e: unknown) => {
+          job.resolving = false;
+          const code = e instanceof DlError ? e.code : "MIRROR_FAILED";
+          if (scheduleJobRetry(job, code)) return;
+          job.state = "error";
+          job.error = code;
+          console.error(`[jobs] job ${job.id} mirror resolution failed: ${code}`);
+        })
+        .finally(() => pump());
+      active++;
     }
   }
 }
@@ -255,8 +292,9 @@ function spawnFfmpegJob(job: Job, args: string[]): void {
   const proc = spawn("ffmpeg", ["-hide_banner", "-loglevel", "error", ...args], {
     stdio: ["ignore", "pipe", "pipe"],
     // tunnel ffmpeg's https inputs through the active egress lane
-    // (googlevideo URLs are IP-locked to the lane that minted them)
-    env: { ...process.env, ...ffmpegProxyEnv() },
+    // (googlevideo URLs are IP-locked to the lane that minted them);
+    // provider-CDN inputs (savenow) are NOT ip-locked → direct egress
+    env: job.plainEgress ? { ...process.env } : { ...process.env, ...ffmpegProxyEnv() },
   });
   job.proc = proc;
   job.state = "downloading";
@@ -265,6 +303,31 @@ function spawnFfmpegJob(job: Job, args: string[]): void {
 }
 
 /* ---------------- creation ---------------- */
+
+/**
+ * Lazy resolver for community-mirror formats. The RawInfo carries
+ * `savenow://<videoId>/<fmt>` placeholders; when the job reaches the pump,
+ * this builder asks the mirror backend to prepare the file server-side
+ * (their own cookie farm extracts it — works even when YouTube blocks us),
+ * then substitutes the returned CDN URL into the ffmpeg argv.
+ */
+function mirrorBuilder(
+  ph: { videoId: string; format: string },
+  makeArgs: () => string[],
+): () => Promise<string[]> {
+  return async () => {
+    console.log(`[jobs] mirror resolution starting for ${ph.videoId}/${ph.format}`);
+    const link = await resolveSavenowUrl(ph.videoId, ph.format);
+    if (!link) {
+      throw new DlError(
+        "MIRROR_TIMEOUT",
+        "The community mirror did not prepare this format in time.",
+      );
+    }
+    console.log(`[jobs] mirror resolved ${ph.videoId}/${ph.format} → ${link.url.slice(0, 72)}…`);
+    return makeArgs().map((a) => (a === "__URL__" ? link.url : a));
+  };
+}
 
 export interface CreateJobInput {
   infoId: string;
@@ -340,6 +403,7 @@ export function createJob(input: CreateJobInput): Job {
   let args: string[];
   let engine: Job["engine"];
   let mode = input.mode;
+  let argsBuilder: (() => Promise<string[]>) | undefined;
 
   if (mode === "mp3") {
     // mode "mp3" covers every audio conversion target (mp3/m4a/opus/flac/wav)
@@ -394,18 +458,22 @@ export function createJob(input: CreateJobInput): Job {
       input.webpageUrl || raw.webpage_url,
     ];
   } else if (mode === "urlfile") {
-    // proxy-provider single stream → ffmpeg remux into the target container
+    // proxy-provider single stream → ffmpeg remux into the target container.
+    // savenow placeholders resolve lazily at pump time (their backend
+    // prepares the finished file server-side, ~10-60 s) then remux runs.
     if (!input.urls?.video) throw new DlError("INVALID_URL", "Missing stream URL.");
     const fmtId = (input.videoFormatId || "").split("|")[0];
     const stored = raw.formats.find((f) => f.format_id === fmtId);
     ext = (stored?.ext || "mp4").toLowerCase();
     engine = "ffmpeg";
-    const out = path.join(jobsDir(), `${randomUUID()}.${ext}`);
+    // output MUST be named job.id.ext — the close handler resolves the file
+    // by that exact name (also makes -y retries overwrite cleanly)
+    const out = path.join(jobsDir(), `${jobId}.${ext}`);
     const isMp4 = ext === "mp4";
-    args = [
+    const buildArgs = (src: string): string[] => [
       "-y",
       "-i",
-      input.urls.video,
+      src,
       "-c",
       "copy",
       ...(isMp4 ? ["-movflags", "+faststart"] : []),
@@ -413,20 +481,46 @@ export function createJob(input: CreateJobInput): Job {
       "pipe:1",
       out,
     ];
+    const phVideo = parseSavenowPlaceholder(input.urls.video);
+    if (phVideo) {
+      args = [];
+      argsBuilder = mirrorBuilder(phVideo, () => buildArgs("__URL__"));
+    } else {
+      args = buildArgs(input.urls.video);
+    }
   } else if (mode === "urlaudio") {
     if (!input.urls?.audio) throw new DlError("INVALID_URL", "Missing audio stream URL.");
     ext = "mp3";
     engine = "ffmpeg";
     const bitrate = [320, 192, 128].includes(input.bitrate || 0) ? input.bitrate : 192;
-    const out = path.join(jobsDir(), `${randomUUID()}.mp3`);
-    args = ["-y", "-i", input.urls.audio, "-vn", "-c:a", "libmp3lame", "-b:a", `${bitrate}K`, "-progress", "pipe:1", out];
+    const out = path.join(jobsDir(), `${jobId}.${ext}`);
+    const buildArgs = (src: string): string[] => [
+      "-y",
+      "-i",
+      src,
+      "-vn",
+      "-c:a",
+      "libmp3lame",
+      "-b:a",
+      `${bitrate}K`,
+      "-progress",
+      "pipe:1",
+      out,
+    ];
+    const phAudio = parseSavenowPlaceholder(input.urls.audio);
+    if (phAudio) {
+      args = [];
+      argsBuilder = mirrorBuilder(phAudio, () => buildArgs("__URL__"));
+    } else {
+      args = buildArgs(input.urls.audio);
+    }
   } else if (mode === "urlmerge") {
     if (!input.urls?.video || !input.urls?.audio)
       throw new DlError("INVALID_URL", "Missing stream URLs for merge.");
     const [vId, aId, container] = (input.videoFormatId || "").split("|");
     ext = ["mp4", "webm", "mkv"].includes(container) ? container : "mkv";
     engine = "ffmpeg";
-    const out = path.join(jobsDir(), `${randomUUID()}.${ext}`);
+    const out = path.join(jobsDir(), `${jobId}.${ext}`);
     const isMp4 = ext === "mp4";
     args = [
       "-y",
@@ -505,12 +599,18 @@ export function createJob(input: CreateJobInput): Job {
     webpageUrl: input.webpageUrl || raw.webpage_url,
     qualityLabel: input.qualityLabel,
     formatSpec: input.videoFormatId || input.audioFormat,
+    argsBuilder,
   };
 
   jobStore().set(fullJob.id, fullJob);
   ensureCleanupTimer();
   ensureStallWatchdog();
-  fullJob.args = args;
+  // builder jobs resolve provider-CDN URLs (savenow) — those are not
+  // IP-locked, and ffmpeg cannot speak socks5 anyway → direct egress
+  fullJob.plainEgress = argsBuilder ? true : fullJob.plainEgress;
+  // builder jobs resolve their argv lazily at pump time — a truthy empty
+  // array here would spawn ffmpeg with no inputs (instant failure)
+  fullJob.args = argsBuilder ? undefined : args;
   pump();
 
   return fullJob;
@@ -592,7 +692,8 @@ function registerFinishedFile(job: Job): void {
 function scheduleJobRetry(job: Job, errCode: string): boolean {
   if (TERMINAL_JOB_CODES.has(errCode)) return false;
   if ((job.retries ?? 0) >= MAX_JOB_RETRIES) return false;
-  if (!job.lastArgs || job.lastArgs.length === 0) return false;
+  // builder jobs re-resolve lazily — they don't need lastArgs
+  if ((!job.lastArgs || job.lastArgs.length === 0) && !job.argsBuilder) return false;
   job.retries = (job.retries ?? 0) + 1;
   job.state = "queued";
   job.phase = "queue";

@@ -1,0 +1,862 @@
+     1→"use client";
+     2→
+     3→import { useCallback, useEffect, useRef, useState } from "react";
+     4→import { toast } from "sonner";
+     5→
+     6→import type { PublicFormat, PublicInfo } from "@/lib/ytdlp";
+     7→import { formatBytes } from "@/lib/format-utils";
+     8→import { errorKey } from "@/lib/i18n";
+     9→import { useLang } from "./use-lang";
+    10→
+    11→/* ------------------------------------------------------------------ */
+    12→/* Types                                                               */
+    13→/* ------------------------------------------------------------------ */
+    14→
+    15→export type ItemState =
+    16→  | "starting"
+    17→  | "queued"
+    18→  | "downloading"
+    19→  | "merging"
+    20→  | "saving"
+    21→  | "done"
+    22→  | "error"
+    23→  | "cancelled";
+    24→
+    25→export interface DownloadItem {
+    26→  id: string;
+    27→  title: string;
+    28→  label: string;
+    29→  filename: string;
+    30→  ext: string;
+    31→  state: ItemState;
+    32→  received: number;
+    33→  total: number;
+    34→  speed: number; // bytes/sec
+    35→  error?: string;
+    36→  jobId?: string;
+    37→  /** direct link for external download managers. Once the server-side file
+    38→   *  is fully downloaded & stored this is the STABLE /api/file/<token> link
+    39→   *  (serves the stored file with resume support, never YouTube); before
+    40→   *  that it is the /api/dl resolve link (fetch-first → 503 until stored). */
+    41→  directLink?: string;
+    42→  /** true once directLink points at the stable stored-file token */
+    43→  directReady?: boolean;
+    44→  videoUrl?: string; // for history
+    45→  thumb?: string;
+    46→}
+    47→
+    48→export interface HistoryEntry {
+    49→  id: string;
+    50→  title: string;
+    51→  thumb: string;
+    52→  label: string;
+    53→  ext: string;
+    54→  size: number;
+    55→  at: number;
+    56→  videoUrl: string;
+    57→  /** stable stored-file link (/api/file/<token>) while it exists */
+    58→  directUrl?: string;
+    59→}
+    60→
+    61→const HISTORY_KEY = "tubegrab.history.v1";
+    62→
+    63→/**
+    64→ * Honest status ladder for the extraction poll. The server cycles through
+    65→ * yt-dlp → Piped/Invidious mirrors → the community-mirror backend on every
+    66→ * attempt; the copy reflects what actually happens at each stage instead of
+    67→ * a vague "busy" line.
+    68→ */
+    69→function pendingStatus(attempts: number, elapsedMs: number): string {
+    70→  if (attempts <= 1) return "Connecting to YouTube…";
+    71→  if (attempts <= 3) return `YouTube is throttling this route — retrying (attempt ${attempts})…`;
+    72→  if (elapsedMs > 180_000)
+    73→    return `Still working — the mirror farm is preparing your file (attempt ${attempts})…`;
+    74→  return `YouTube blocked us — community mirrors engaged (attempt ${attempts})…`;
+    75→}
+    76→
+    77→/* ------------------------------------------------------------------ */
+    78→/* File-system access helpers                                          */
+    79→/* ------------------------------------------------------------------ */
+    80→
+    81→type SavePicker = (opts: {
+    82→  suggestedName: string;
+    83→  types: Array<{ description: string; accept: Record<string, string[]> }>;
+    84→}) => Promise<FileSystemFileHandle>;
+    85→
+    86→async function openWritable(
+    87→  filename: string,
+    88→  mime: string,
+    89→  ext: string,
+    90→): Promise<FileSystemWritableFileStream | null> {
+    91→  const w = window as unknown as { showSaveFilePicker?: SavePicker };
+    92→  // automation/headless environments can't render the native picker → blob path
+    93→  const automated = typeof navigator !== "undefined" && navigator.webdriver === true;
+    94→  if (!w.showSaveFilePicker || automated) return null;
+    95→  try {
+    96→    const handle = await w.showSaveFilePicker({
+    97→      suggestedName: filename,
+    98→      types: [{ description: `${ext.toUpperCase()} file`, accept: { [mime]: [`.${ext}`] } }],
+    99→    });
+   100→    return await handle.createWritable();
+   101→  } catch (e) {
+   102→    const name = (e as DOMException)?.name;
+   103→    if (name === "AbortError") throw e; // user cancelled → abort whole download
+   104→    return null; // permission/iframe issue → blob fallback
+   105→  }
+   106→}
+   107→
+   108→function mimeForExt(ext: string): string {
+   109→  switch (ext) {
+   110→    case "mp4":
+   111→      return "video/mp4";
+   112→    case "webm":
+   113→      return "video/webm";
+   114→    case "mkv":
+   115→      return "video/x-matroska";
+   116→    case "m4a":
+   117→      return "audio/mp4";
+   118→    case "mp3":
+   119→      return "audio/mpeg";
+   120→    default:
+   121→      return "application/octet-stream";
+   122→  }
+   123→}
+   124→
+   125→/**
+   126→ * Build the /api/dl resolve link for a selection (pre-store fallback).
+   127→ * When a download manager (or browser) hits it, the SERVER downloads the
+   128→ * file fully first (answering 503 + Retry-After meanwhile), then serves the
+   129→ * finished file with Range/resume — the client never touches YouTube.
+   130→ */
+   131→export function buildDlLink(
+   132→  fmt: PublicFormat,
+   133→  info: PublicInfo,
+   134→  bitrate?: number,
+   135→): string {
+   136→  const isConversion =
+   137→    fmt.kind === "audio" &&
+   138→    (fmt.id === "convert" || ["mp3", "flac", "wav"].includes(fmt.container));
+   139→  const f = isConversion ? fmt.container : fmt.id;
+   140→  const qs = new URLSearchParams({
+   141→    u: info.webpageUrl,
+   142→    f,
+   143→    q: fmt.quality || "",
+   144→    t: info.title || "",
+   145→  });
+   146→  if (isConversion && fmt.container === "mp3") qs.set("b", String(bitrate ?? 320));
+   147→  return `/api/dl?${qs.toString()}`;
+   148→}
+   149→
+   150→/* ------------------------------------------------------------------ */
+   151→/* Hook                                                                */
+   152→/* ------------------------------------------------------------------ */
+   153→
+   154→export function useDownloader() {
+   155→  const { t } = useLang();
+   156→
+   157→  const [url, setUrl] = useState("");
+   158→  const [phase, setPhase] = useState<"idle" | "loading" | "ready" | "error">("idle");
+   159→  const [pendingNote, setPendingNote] = useState<string | null>(null);
+   160→  const [info, setInfo] = useState<PublicInfo | null>(null);
+   161→  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+   162→  const [errorCode, setErrorCode] = useState<string | null>(null);
+   163→  const [items, setItems] = useState<DownloadItem[]>([]);
+   164→  const [history, setHistory] = useState<HistoryEntry[]>([]);
+   165→
+   166→  const controllers = useRef(new Map<string, AbortController>());
+   167→  const samplers = useRef(
+   168→    new Map<string, { lastT: number; lastB: number; ema: number; lastRender: number }>(),
+   169→  );
+   170→
+   171→  // Load persisted history AFTER hydration — reading localStorage during render
+   172→  // makes the first client render differ from the server HTML (hydration error).
+   173→  useEffect(() => {
+   174→    try {
+   175→      const raw = window.localStorage.getItem(HISTORY_KEY);
+   176→      if (raw) setHistory(JSON.parse(raw) as HistoryEntry[]);
+   177→    } catch {
+   178→      /* ignore */
+   179→    }
+   180→  }, []);
+   181→
+   182→  const pushHistory = useCallback((entry: HistoryEntry) => {
+   183→    setHistory((prev) => {
+   184→      const next = [entry, ...prev].slice(0, 20);
+   185→      try {
+   186→        window.localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
+   187→      } catch {
+   188→        /* ignore */
+   189→      }
+   190→      return next;
+   191→    });
+   192→  }, []);
+   193→
+   194→  const clearHistory = useCallback(() => {
+   195→    setHistory([]);
+   196→    try {
+   197→      window.localStorage.removeItem(HISTORY_KEY);
+   198→    } catch {
+   199→      /* ignore */
+   200→    }
+   201→  }, []);
+   202→
+   203→  const patchItem = useCallback((id: string, patch: Partial<DownloadItem>, force = false) => {
+   204→    setItems((prev) => {
+   205→      const idx = prev.findIndex((it) => it.id === id);
+   206→      if (idx === -1) return prev;
+   207→      const next = [...prev];
+   208→      next[idx] = { ...next[idx], ...patch };
+   209→      return next;
+   210→    });
+   211→    void force;
+   212→  }, []);
+   213→
+   214→  /* ---------------- info fetching ---------------- */
+   215→
+   216→  const fetchInfo = useCallback(
+   217→    async (rawUrl: string) => {
+   218→      const clean = rawUrl.trim();
+   219→      if (!clean) return;
+   220→      setPhase("loading");
+   221→      setErrorMsg(null);
+   222→      setErrorCode(null);
+   223→      try {
+   224→        const res = await fetch("/api/info", {
+   225→          method: "POST",
+   226→          headers: { "Content-Type": "application/json" },
+   227→          body: JSON.stringify({ url: clean }),
+   228→          // the server answers within ~26 s: either the result or a 202
+   229→          // "pending" that its background retry loop now owns
+   230→          signal: AbortSignal.timeout(30_000),
+   231→        });
+   232→        if (res.status === 202) {
+   233→          // cobalt-style session: the server keeps retrying through tunnel
+   234→          // phases — poll until done / failed / user gives up
+   235→          const deadline = Date.now() + 12 * 60_000;
+   236→          while (Date.now() < deadline) {
+   237→            await new Promise((r) => setTimeout(r, 4_000));
+   238→            const pr = await fetch(`/api/info?u=${encodeURIComponent(clean)}`, {
+   239→              signal: AbortSignal.timeout(10_000),
+   240→            }).catch(() => null);
+   241→            if (!pr) {
+   242→              setPendingNote("Reconnecting…");
+   243→              continue;
+   244→            }
+   245→            if (pr.status === 200) {
+   246→              const json = await pr.json();
+   247→              if (json?.info) {
+   248→                setInfo(json.info as PublicInfo);
+   249→                setPhase("ready");
+   250→                setPendingNote(null);
+   251→                return;
+   252→              }
+   253→              continue;
+   254→            }
+   255→            if (pr.status === 202) {
+   256→              const j = await pr.json().catch(() => null);
+   257→              const n = j?.attempts ?? 0;
+   258→              const elapsed = j?.elapsedMs ?? 0;
+   259→              setPendingNote(pendingStatus(n, elapsed));
+   260→              continue;
+   261→            }
+   262→            const j = await pr.json().catch(() => null);
+   263→            setPhase("error");
+   264→            setPendingNote(null);
+   265→            setErrorCode(j?.error?.code || "FETCH_FAILED");
+   266→            setErrorMsg(j?.error?.message || "Failed");
+   267→            return;
+   268→          }
+   269→          setPhase("error");
+   270→          setPendingNote(null);
+   271→          setErrorCode("TIMEOUT");
+   272→          setErrorMsg("The engine could not reach YouTube in time — try again in a few minutes.");
+   273→          return;
+   274→        }
+   275→        const json = await res.json();
+   276→        if (!res.ok || json.error) {
+   277→          setPhase("error");
+   278→          setPendingNote(null);
+   279→          setErrorCode(json?.error?.code || "FETCH_FAILED");
+   280→          setErrorMsg(json?.error?.message || "Failed");
+   281→          return;
+   282→        }
+   283→        setInfo(json.info as PublicInfo);
+   284→        setPendingNote(null);
+   285→        setPhase("ready");
+   286→      } catch (e) {
+   287→        setPhase("error");
+   288→        setPendingNote(null);
+   289→        setErrorCode("FETCH_FAILED");
+   290→        const aborted = e instanceof DOMException && e.name === "TimeoutError";
+   291→        setErrorMsg(
+   292→          aborted
+   293→            ? "The engine took too long — the tunnel is congested. Try again in a minute."
+   294→            : "Network error",
+   295→        );
+   296→      }
+   297→    },
+   298→    [],
+   299→  );
+   300→
+   301→  const reset = useCallback(() => {
+   302→    setUrl("");
+   303→    setInfo(null);
+   304→    setPhase("idle");
+   305→    setErrorMsg(null);
+   306→    setErrorCode(null);
+   307→    setPendingNote(null);
+   308→  }, []);
+   309→
+   310→  /* ---------------- sampler ---------------- */
+   311→
+   312→  const sampleSpeed = useCallback((id: string, received: number): number => {
+   313→    const now = performance.now();
+   314→    const s = samplers.current.get(id) ?? { lastT: now, lastB: received, ema: 0, lastRender: 0 };
+   315→    const dt = (now - s.lastT) / 1000;
+   316→    if (dt >= 0.4) {
+   317→      const inst = (received - s.lastB) / dt;
+   318→      s.ema = s.ema === 0 ? inst : s.ema * 0.7 + inst * 0.3;
+   319→      s.lastT = now;
+   320→      s.lastB = received;
+   321→    }
+   322→    samplers.current.set(id, s);
+   323→    return s.ema;
+   324→  }, []);
+   325→
+   326→  /* ---------------- core streaming save (auto-resume) ---------------- */
+   327→
+   328→  const streamToDisk = useCallback(
+   329→    async (
+   330→      itemId: string,
+   331→      open: (range?: string) => Promise<Response>,
+   332→      item: {
+   333→        filename: string;
+   334→        ext: string;
+   335→        label: string;
+   336→        title: string;
+   337→        videoUrl?: string;
+   338→        thumb?: string;
+   339→        directUrl?: string; // native-download fallback for browsers without the File System Access API
+   340→        storedDirectUrl?: string; // stable /api/file/<token> link once the file is stored server-side
+   341→      },
+   342→      expectedTotal: number,
+   343→      signal: AbortSignal,
+   344→    ) => {
+   345→      // Slow/flaky networks: a dropped connection or a hiccup on the server no
+   346→      // longer kills the transfer — we re-request with `Range: bytes=<n>-` and
+   347→      // continue into the SAME file, up to 15 times.
+   348→      const MAX_RESUMES = 15;
+   349→      let received = 0; // absolute offset across resumes
+   350→      let total = expectedTotal || 0;
+   351→      let writer: FileSystemWritableFileStream | null = null;
+   352→      let writerReady = false;
+   353→      const chunks: Uint8Array[] = []; // blob fallback path
+   354→      let resumes = 0;
+   355→      const mime = mimeForExt(item.ext);
+   356→      const backoff = () => new Promise((r) => setTimeout(r, 700 + resumes * 500));
+   357→
+   358→      for (;;) {
+   359→        /* ---- (re)open the response ---- */
+   360→        let res: Response;
+   361→        try {
+   362→          res = await open(received > 0 ? `bytes=${received}-` : undefined);
+   363→        } catch {
+   364→          if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+   365→          if (received === 0 || resumes >= MAX_RESUMES) throw new Error("FETCH_FAILED");
+   366→          resumes++;
+   367→          await backoff();
+   368→          continue;
+   369→        }
+   370→
+   371→        if (!res.ok && res.status !== 206) {
+   372→          let code = "FETCH_FAILED";
+   373→          try {
+   374→            const j = await res.json();
+   375→            code = j?.error?.code || code;
+   376→          } catch {
+   377→            /* ignore */
+   378→          }
+   379→          // fatal: nothing to resume from, or the source is gone for good
+   380→          if (
+   381→            received === 0 ||
+   382→            code === "NOT_FOUND" ||
+   383→            code === "EXPIRED" ||
+   384→            code === "USE_JOB" ||
+   385→            code === "NO_FORMATS" ||
+   386→            res.status === 416
+   387→          ) {
+   388→            throw new Error(code);
+   389→          }
+   390→          if (resumes >= MAX_RESUMES) throw new Error(code);
+   391→          resumes++;
+   392→          await backoff();
+   393→          continue;
+   394→        }
+   395→
+   396→        if (!res.body) {
+   397→          if (received === 0) throw new Error("FETCH_FAILED");
+   398→          resumes++;
+   399→          await backoff();
+   400→          continue;
+   401→        }
+   402→
+   403→        /* ---- size bookkeeping ---- */
+   404→        const clen = Number(res.headers.get("content-length")) || 0;
+   405→        const crange = res.headers.get("content-range");
+   406→        if (crange) {
+   407→          const m = crange.match(/\/(\d+)/);
+   408→          if (m) total = parseInt(m[1], 10);
+   409→        } else if (received === 0 && clen > 0) {
+   410→          total = clen;
+   411→        }
+   412→
+   413→        if (!writerReady) {
+   414→          writerReady = true;
+   415→          try {
+   416→            writer = await openWritable(item.filename, mime, item.ext);
+   417→          } catch {
+   418→            // user dismissed the save dialog → cancel silently
+   419→            patchItem(itemId, { state: "cancelled" });
+   420→            return;
+   421→          }
+   422→        }
+   423→
+   424→        patchItem(itemId, { state: "downloading", total, received });
+   425→
+   426→        /* ---- pump the current stream ---- */
+   427→        const reader = res.body.getReader();
+   428→        let streamError: unknown = null;
+   429→        let lastUi = 0;
+   430→        try {
+   431→          for (;;) {
+   432→            if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+   433→            const { done, value } = await reader.read();
+   434→            if (done) break;
+   435→            received += value.length;
+   436→            if (writer) {
+   437→              await writer.write(value);
+   438→            } else {
+   439→              chunks.push(value);
+   440→            }
+   441→            const speed = sampleSpeed(itemId, received);
+   442→            const now = performance.now();
+   443→            if (now - lastUi > 140) {
+   444→              lastUi = now;
+   445→              patchItem(itemId, { received, speed, total: total || Math.max(total, received) });
+   446→            }
+   447→          }
+   448→        } catch (e) {
+   449→          streamError = e;
+   450→        } finally {
+   451→          try {
+   452→            reader.releaseLock();
+   453→          } catch {
+   454→            /* ignore */
+   455→          }
+   456→          try {
+   457→            await reader.cancel();
+   458→          } catch {
+   459→            /* ignore */
+   460→          }
+   461→        }
+   462→
+   463→        if (streamError && signal.aborted) {
+   464→          try {
+   465→            await writer?.abort();
+   466→          } catch {
+   467→            /* ignore */
+   468→          }
+   469→          throw new DOMException("Aborted", "AbortError");
+   470→        }
+   471→
+   472→        // clean EOF with the full size delivered → done; clean EOF but short →
+   473→        // treat exactly like a broken stream and resume
+   474→        const complete = !streamError && (total === 0 || received >= total);
+   475→        if (complete) break;
+   476→
+   477→        resumes++;
+   478→        if (resumes > MAX_RESUMES) {
+   479→          try {
+   480→            await writer?.abort();
+   481→          } catch {
+   482→            /* ignore */
+   483→          }
+   484→          throw (streamError as Error) || new Error("INCOMPLETE");
+   485→        }
+   486→        console.log(`[download] auto-resume at ${received}/${total || "?"} (attempt ${resumes})`);
+   487→        patchItem(itemId, { speed: 0 });
+   488→        await backoff();
+   489→      }
+   490→
+   491→      if (writer) {
+   492→        await writer.close();
+   493→      } else if (item.directUrl) {
+   494→        // No File System Access API (Firefox/Safari) — do NOT buffer the file
+   495→        // in RAM as a blob. Hand the transfer to the browser's native download
+   496→        // manager via Content-Disposition (streams to disk, supports pause on
+   497→        // most browsers, zero memory blowup on multi-hundred-MB files).
+   498→        patchItem(itemId, { state: "saving" }, true);
+   499→        const a = document.createElement("a");
+   500→        a.href = item.directUrl;
+   501→        a.download = item.filename;
+   502→        document.body.appendChild(a);
+   503→        a.click();
+   504→        a.remove();
+   505→      } else {
+   506→        patchItem(itemId, { state: "saving" }, true);
+   507→        const blob = new Blob(chunks as BlobPart[], { type: mime });
+   508→        const objUrl = URL.createObjectURL(blob);
+   509→        const a = document.createElement("a");
+   510→        a.href = objUrl;
+   511→        a.download = item.filename;
+   512→        document.body.appendChild(a);
+   513→        a.click();
+   514→        a.remove();
+   515→        setTimeout(() => URL.revokeObjectURL(objUrl), 60_000);
+   516→      }
+   517→
+   518→      patchItem(itemId, { state: "done", received, total: total || received, speed: 0 }, true);
+   519→      pushHistory({
+   520→        id: `${Date.now()}-${item.label}`,
+   521→        title: item.title,
+   522→        thumb: item.thumb || "",
+   523→        label: item.label,
+   524→        ext: item.ext,
+   525→        size: received,
+   526→        at: Date.now(),
+   527→        videoUrl: item.videoUrl || "",
+   528→        directUrl: item.storedDirectUrl,
+   529→      });
+   530→      toast.success(t("downloadComplete"), { description: `${item.filename} · ${formatBytes(received)}` });
+   531→    },
+   532→    [patchItem, pushHistory, sampleSpeed, t],
+   533→  );
+   534→
+   535→  /* ---------------- job polling ---------------- */
+   536→
+   537→  interface JobPoll {
+   538→    state: string;
+   539→    phase: string;
+   540→    progress: number;
+   541→    speed: string | null;
+   542→    receivedBytes: number;
+   543→    sizeBytes: number | null;
+   544→    error: string | null;
+   545→    directUrl?: string | null;
+   546→  }
+   547→
+   548→  const pollJob = useCallback(
+   549→    async (itemId: string, jobId: string, signal: AbortSignal): Promise<JobPoll> => {
+   550→      for (;;) {
+   551→        if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+   552→        await new Promise((r) => setTimeout(r, 700));
+   553→        const res = await fetch(`/api/jobs/${jobId}`, { signal });
+   554→        const json = await res.json();
+   555→        if (!res.ok || json.error) throw new Error(json?.error?.code || "NOT_FOUND");
+   556→        let job = json.job as JobPoll;
+   557→        if (job.state === "ready") {
+   558→          // the finished file is registered in the store right after "ready"
+   559→          // — one extra poll picks up the stable token link if it raced us
+   560→          if (!job.directUrl) {
+   561→            await new Promise((r) => setTimeout(r, 900));
+   562→            try {
+   563→              const again = await fetch(`/api/jobs/${jobId}`, { signal });
+   564→              const j2 = await again.json();
+   565→              if (again.ok && j2?.job?.directUrl) job = j2.job as JobPoll;
+   566→            } catch {
+   567→              /* keep what we have */
+   568→            }
+   569→          }
+   570→          return job;
+   571→        }
+   572→        if (job.state === "error") throw new Error(job.error || "INTERNAL");
+   573→        if (job.state === "cancelled") throw new DOMException("Cancelled", "AbortError");
+   574→        patchItem(itemId, {
+   575→          state: job.state === "merging" ? "merging" : job.state === "downloading" ? "downloading" : "queued",
+   576→          received: job.receivedBytes,
+   577→          total: job.sizeBytes ?? 0,
+   578→        });
+   579→      }
+   580→    },
+   581→    [patchItem],
+   582→  );
+   583→
+   584→  /* ---------------- start downloads ---------------- */
+   585→
+   586→  const startDownload = useCallback(
+   587→    async (fmt: PublicFormat, infoData: PublicInfo, overrideBitrate?: number) => {
+   588→      // audio conversions: mp3/flac/wav always re-encode; m4a/opus only when no
+   589→      // native stream of that container exists (fmt.id === "convert")
+   590→      const isConversion =
+   591→        fmt.kind === "audio" &&
+   592→        (fmt.id === "convert" || ["mp3", "flac", "wav"].includes(fmt.container));
+   593→      const label = isConversion
+   594→        ? fmt.container === "mp3"
+   595→          ? `MP3 ${overrideBitrate ?? 320}`
+   596→          : fmt.container.toUpperCase()
+   597→        : fmt.kind === "video"
+   598→          ? `${fmt.quality} · ${fmt.container.toUpperCase()}`
+   599→          : `${fmt.quality} · ${fmt.container.toUpperCase()}`;
+   600→      const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+   601→      const filename = `${infoData.title.slice(0, 80).replace(/[\\/:*?"<>|]/g, " ").trim()} (${label.replace(/[\\/:*?"<>|]/g, "-")}).${fmt.container}`;
+   602→      const ctrl = new AbortController();
+   603→      controllers.current.set(id, ctrl);
+   604→      samplers.current.set(id, { lastT: performance.now(), lastB: 0, ema: 0, lastRender: 0 });
+   605→
+   606→      const shell: DownloadItem = {
+   607→        id,
+   608→        title: infoData.title,
+   609→        label,
+   610→        filename,
+   611→        ext: fmt.container,
+   612→        state: "starting",
+   613→        received: 0,
+   614→        total: fmt.filesize || 0,
+   615→        speed: 0,
+   616→        videoUrl: infoData.webpageUrl,
+   617→        thumb: infoData.thumbnail,
+   618→        directLink: buildDlLink(fmt, infoData, overrideBitrate),
+   619→      };
+   620→      setItems((prev) => [shell, ...prev].slice(0, 12));
+   621→
+   622→      try {
+   623→        /* ================================================================
+   624→         * MIDDLEMAN FLOW — every download is a server job. The server
+   625→         * (fast pipe + WARP) pulls from YouTube FIRST; the user's browser
+   626→         * or external manager then fetches the finished file from THIS
+   627→         * app with Range/resume. The user's own connection never touches
+   628→         * YouTube, which is what makes this reliable on slow/censored
+   629→         * networks (Iran etc.).
+   630→         * ================================================================ */
+   631→        {
+   632→          const isMerge = fmt.needsMerge;
+   633→          const res = await fetch("/api/jobs", {
+   634→            method: "POST",
+   635→            headers: { "Content-Type": "application/json" },
+   636→            body: JSON.stringify({
+   637→              infoId: infoData.infoId,
+   638→              mode: isConversion ? "mp3" : isMerge ? "merge" : "file",
+   639→              videoFormatId: isConversion ? undefined : fmt.id,
+   640→              audioFormat: isConversion ? fmt.container : undefined,
+   641→              bitrate: isConversion ? overrideBitrate ?? 320 : undefined,
+   642→              title: infoData.title,
+   643→              webpageUrl: infoData.webpageUrl,
+   644→              quality: fmt.quality || "",
+   645→            }),
+   646→            signal: ctrl.signal,
+   647→          });
+   648→          const json = await res.json();
+   649→          if (!res.ok || json.error) throw new Error(json?.error?.code || "INTERNAL");
+   650→          const job = json.job as { id: string; sizeBytes: number | null };
+   651→          patchItem(id, { jobId: job.id, state: "queued", total: job.sizeBytes || fmt.filesize || 0 }, true);
+   652→          const done = await pollJob(id, job.id, ctrl.signal);
+   653→          // the file is now STORED server-side → swap in the stable token link
+   654→          if (done.directUrl) {
+   655→            patchItem(id, { directLink: done.directUrl, directReady: true }, true);
+   656→          }
+   657→          const fileUrl = `/api/jobs/${job.id}/file`;
+   658→          await streamToDisk(
+   659→            id,
+   660→            (range) =>
+   661→              fetch(fileUrl, {
+   662→                signal: ctrl.signal,
+   663→                headers: range ? { Range: range } : undefined,
+   664→              }),
+   665→            { ...shell, directUrl: fileUrl, storedDirectUrl: done.directUrl ?? undefined },
+   666→            fmt.filesize || 0,
+   667→            ctrl.signal,
+   668→          );
+   669→        }
+   670→      } catch (e) {
+   671→        const err = e as Error & { name?: string };
+   672→        if (err.name === "AbortError" || err.message === "Cancelled") {
+   673→          patchItem(id, { state: "cancelled", speed: 0 }, true);
+   674→        } else {
+   675→          patchItem(id, { state: "error", error: err.message || "INTERNAL", speed: 0 }, true);
+   676→          toast.error(t("downloadFailed"), { description: t(errorKey(err.message)) });
+   677→        }
+   678→      } finally {
+   679→        controllers.current.delete(id);
+   680→        samplers.current.delete(id);
+   681→      }
+   682→    },
+   683→    [patchItem, pollJob, streamToDisk, t],
+   684→  );
+   685→
+   686→  const cancelItem = useCallback(
+   687→    (item: DownloadItem) => {
+   688→      const ctrl = controllers.current.get(item.id);
+   689→      ctrl?.abort();
+   690→      controllers.current.delete(item.id);
+   691→      if (item.jobId) {
+   692→        void fetch(`/api/jobs/${item.jobId}`, { method: "DELETE" }).catch(() => undefined);
+   693→      }
+   694→      patchItem(item.id, { state: "cancelled", speed: 0 }, true);
+   695→    },
+   696→    [patchItem],
+   697→  );
+   698→
+   699→  const removeItem = useCallback(
+   700→    (id: string) => {
+   701→      setItems((prev) => prev.filter((it) => it.id !== id));
+   702→    },
+   703→    [],
+   704→  );
+   705→
+   706→  const clearFinished = useCallback(() => {
+   707→    setItems((prev) => prev.filter((it) => it.state !== "done" && it.state !== "cancelled" && it.state !== "error"));
+   708→  }, []);
+   709→
+   710→  /* ---------------- direct link (fetch-first) ---------------- */
+   711→
+   712→  /**
+   713→   * "🔗 Direct link" — the file must be ON THE SERVER before a link is
+   714→   * handed out. Ready file → copy the stable /api/file/<token> link
+   715→   * instantly. Otherwise the server starts downloading it first and a
+   716→   * tracking row appears in Downloads; the stable link shows up on that
+   717→   * row (Copy direct link) the moment the file is stored.
+   718→   */
+   719→  const getDirectLink = useCallback(
+   720→    async (fmt: PublicFormat, infoData: PublicInfo, overrideBitrate?: number) => {
+   721→      const isConversion =
+   722→        fmt.kind === "audio" &&
+   723→        (fmt.id === "convert" || ["mp3", "flac", "wav"].includes(fmt.container));
+   724→      const spec = {
+   725→        url: infoData.webpageUrl,
+   726→        format: isConversion ? fmt.container : fmt.id,
+   727→        quality: fmt.quality || "",
+   728→        bitrate: isConversion && fmt.container === "mp3" ? overrideBitrate ?? 320 : undefined,
+   729→        title: infoData.title,
+   730→      };
+   731→      try {
+   732→        const res = await fetch("/api/dl-resolve", {
+   733→          method: "POST",
+   734→          headers: { "Content-Type": "application/json" },
+   735→          body: JSON.stringify(spec),
+   736→        });
+   737→        const json = await res.json();
+   738→        if (json.status === "ready" && json.directUrl) {
+   739→          const abs = `${window.location.origin}${json.directUrl}`;
+   740→          void navigator.clipboard?.writeText(abs).catch(() => undefined);
+   741→          toast.success("Direct link copied", {
+   742→            description: `Stored on the YouWee server (${formatBytes(json.sizeBytes || 0)}) — downloads from here with full resume support. Paste it in IDM, aria2 or any browser.`,
+   743→          });
+   744→          return;
+   745→        }
+   746→        if (json.status === "busy") {
+   747→          const label = isConversion
+   748→            ? fmt.container.toUpperCase()
+   749→            : fmt.kind === "video"
+   750→              ? `${fmt.quality} · ${fmt.container.toUpperCase()}`
+   751→              : `${fmt.quality} · ${fmt.container.toUpperCase()}`;
+   752→          const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+   753→          const ctrl = new AbortController();
+   754→          controllers.current.set(id, ctrl);
+   755→          setItems((prev) =>
+   756→            [
+   757→              {
+   758→                id,
+   759→                title: infoData.title,
+   760→                label,
+   761→                filename: `${infoData.title.slice(0, 80)} (${label}).${fmt.container}`,
+   762→                ext: fmt.container,
+   763→                state: "queued" as ItemState,
+   764→                received: 0,
+   765→                total: fmt.filesize || 0,
+   766→                speed: 0,
+   767→                jobId: json.jobId || undefined,
+   768→                videoUrl: infoData.webpageUrl,
+   769→                thumb: infoData.thumbnail,
+   770→                directLink: buildDlLink(fmt, infoData, overrideBitrate),
+   771→              },
+   772→              ...prev,
+   773→            ].slice(0, 12),
+   774→          );
+   775→          toast.info("Fetching on the server first…", {
+   776→            description: "The file is being downloaded to YouWee's server at full speed. The direct link appears on the row below as soon as it's stored.",
+   777→          });
+   778→          try {
+   779→            if (json.jobId) {
+   780→              const done = await pollJob(id, json.jobId, ctrl.signal);
+   781→              if (done.directUrl) {
+   782→                patchItem(id, { state: "done", directLink: done.directUrl, directReady: true, total: done.sizeBytes ?? 0 }, true);
+   783→                pushHistory({
+   784→                  id: `${Date.now()}-${label}`,
+   785→                  title: infoData.title,
+   786→                  thumb: infoData.thumbnail || "",
+   787→                  label,
+   788→                  ext: fmt.container,
+   789→                  size: done.sizeBytes ?? 0,
+   790→                  at: Date.now(),
+   791→                  videoUrl: infoData.webpageUrl,
+   792→                  directUrl: done.directUrl,
+   793→                });
+   794→                toast.success("Direct link is ready", {
+   795→                  description: "The file is stored on the server — grab it from the row below (Copy direct link).",
+   796→                });
+   797→              } else {
+   798→                patchItem(id, { state: "done", total: done.sizeBytes ?? 0 }, true);
+   799→              }
+   800→            } else {
+   801→              // warm-up still resolving (no job yet) → poll the resolver
+   802→              for (;;) {
+   803→                if (ctrl.signal.aborted) throw new DOMException("Aborted", "AbortError");
+   804→                await new Promise((r) => setTimeout(r, 2500));
+   805→                const r2 = await fetch("/api/dl-resolve", {
+   806→                  method: "POST",
+   807→                  headers: { "Content-Type": "application/json" },
+   808→                  body: JSON.stringify(spec),
+   809→                  signal: ctrl.signal,
+   810→                });
+   811→                const j2 = await r2.json();
+   812→                if (j2.status === "ready" && j2.directUrl) {
+   813→                  patchItem(id, { state: "done", directLink: j2.directUrl, directReady: true, total: j2.sizeBytes ?? 0 }, true);
+   814→                  toast.success("Direct link is ready", {
+   815→                    description: "The file is stored on the server — grab it from the row below (Copy direct link).",
+   816→                  });
+   817→                  break;
+   818→                }
+   819→                if (j2.status === "failed") throw new Error(j2.code || "INTERNAL");
+   820→              }
+   821→            }
+   822→          } catch (e) {
+   823→            const err = e as Error & { name?: string };
+   824→            if (err.name === "AbortError") patchItem(id, { state: "cancelled" }, true);
+   825→            else {
+   826→              patchItem(id, { state: "error", error: err.message }, true);
+   827→              toast.error(t("downloadFailed"), { description: t(errorKey(err.message)) });
+   828→            }
+   829→          } finally {
+   830→            controllers.current.delete(id);
+   831→          }
+   832→          return;
+   833→        }
+   834→        toast.error(t("downloadFailed"), { description: t(errorKey(json.code || "INTERNAL")) });
+   835→      } catch {
+   836→        toast.error(t("downloadFailed"), { description: "Network error" });
+   837→      }
+   838→    },
+   839→    [patchItem, pollJob, pushHistory, t],
+   840→  );
+   841→
+   842→  return {
+   843→    url,
+   844→    setUrl,
+   845→    phase,
+   846→    pendingNote,
+   847→    info,
+   848→    errorMsg,
+   849→    errorCode,
+   850→    items,
+   851→    history,
+   852→    fetchInfo,
+   853→    reset,
+   854→    startDownload,
+   855→    getDirectLink,
+   856→    cancelItem,
+   857→    removeItem,
+   858→    clearFinished,
+   859→    clearHistory,
+   860→  };
+   861→}
+   862→

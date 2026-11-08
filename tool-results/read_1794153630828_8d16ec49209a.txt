@@ -1,0 +1,747 @@
+     1→"use client";
+     2→
+     3→/**
+     4→ * YouWee — 1:1 port of the original desktop app UI.
+     5→ * Topbar (brand + ↺ history + ⚙ settings), URL card, video panel with
+     6→ * quality tiles / codec chips / audio segments, live job rows, and the
+     7→ * settings + history overlays. Powered by the hardened yt-dlp engine
+     8→ * (WARP egress lane, PO tokens, client rotation).
+     9→ */
+    10→import { useCallback, useEffect, useMemo, useState } from "react";
+    11→import { toast } from "sonner";
+    12→import "@/styles/youwee.css";
+    13→import { useDownloader, type DownloadItem } from "@/hooks/use-downloader";
+    14→import { LangProvider } from "@/hooks/use-lang";
+    15→import type { PublicFormat, PublicInfo } from "@/lib/ytdlp";
+    16→
+    17→/* ------------------------------------------------------------------ */
+    18→/* constants (identical to the original VideoPanel)                    */
+    19→/* ------------------------------------------------------------------ */
+    20→
+    21→const QUALITIES = ["2160p", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p"];
+    22→const CODECS = ["H.264 (AVC)", "VP9", "AV1"];
+    23→const AUDIO = ["M4A", "MP3", "Opus", "FLAC", "WAV"];
+    24→const MP3_BITRATES = [320, 192, 128];
+    25→
+    26→function fmtDuration(sec: number): string {
+    27→  if (!sec || sec <= 0) return "";
+    28→  const h = Math.floor(sec / 3600);
+    29→  const m = Math.floor((sec % 3600) / 60);
+    30→  const s = Math.floor(sec % 60);
+    31→  return h > 0
+    32→    ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+    33→    : `${m}:${String(s).padStart(2, "0")}`;
+    34→}
+    35→
+    36→function fmtBytes(b: number): string {
+    37→  if (!b || b <= 0) return "";
+    38→  const units = ["B", "KB", "MB", "GB"];
+    39→  let i = 0;
+    40→  let v = b;
+    41→  while (v >= 1024 && i < units.length - 1) {
+    42→    v /= 1024;
+    43→    i++;
+    44→  }
+    45→  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
+    46→}
+    47→
+    48→function qualityHeight(q: string): number {
+    49→  return parseInt(q, 10) || 0;
+    50→}
+    51→
+    52→function fmtHeight(f: PublicFormat): number {
+    53→  const m = f.quality?.match(/(\d{3,4})/);
+    54→  return m ? parseInt(m[1], 10) : 0;
+    55→}
+    56→
+    57→function fmtCodec(f: PublicFormat): string | null {
+    58→  const v = (f.vcodec ?? "").toLowerCase();
+    59→  if (v.startsWith("h264") || v.startsWith("h.264") || v.startsWith("avc")) return "H.264 (AVC)";
+    60→  if (v.startsWith("vp9") || v.startsWith("vp09")) return "VP9";
+    61→  if (v.startsWith("av1") || v.startsWith("av01")) return "AV1";
+    62→  return null;
+    63→}
+    64→
+    65→/* ------------------------------------------------------------------ */
+    66→/* root                                                                */
+    67→/* ------------------------------------------------------------------ */
+    68→
+    69→export function DownloaderApp() {
+    70→  const [settingsOpen, setSettingsOpen] = useState(false);
+    71→  const [historyOpen, setHistoryOpen] = useState(false);
+    72→
+    73→  return (
+    74→    <LangProvider initialLang="en">
+    75→      <div className="yw-app-root">
+    76→        <div className="app">
+    77→          <Header onOpenHistory={() => setHistoryOpen(true)} onOpenSettings={() => setSettingsOpen(true)} />
+    78→          <Downloader />
+    79→        </div>
+    80→        {settingsOpen && <Settings onClose={() => setSettingsOpen(false)} />}
+    81→        {historyOpen && <History onClose={() => setHistoryOpen(false)} />}
+    82→      </div>
+    83→    </LangProvider>
+    84→  );
+    85→}
+    86→
+    87→/* ------------------------------------------------------------------ */
+    88→/* header                                                              */
+    89→/* ------------------------------------------------------------------ */
+    90→
+    91→function Header({ onOpenSettings, onOpenHistory }: { onOpenSettings: () => void; onOpenHistory: () => void }) {
+    92→  return (
+    93→    <header className="topbar">
+    94→      <div className="brand">
+    95→        <div className="logo">▶</div>
+    96→        <div>
+    97→          <div className="brand-name">YouWee</div>
+    98→          <div className="brand-sub">YouTube Downloader</div>
+    99→        </div>
+   100→      </div>
+   101→      <div className="top-actions">
+   102→        <button className="icon-btn" title="History" aria-label="History" onClick={onOpenHistory}>
+   103→          ↺
+   104→        </button>
+   105→        <button className="icon-btn" title="Settings" aria-label="Settings" onClick={onOpenSettings}>
+   106→          ⚙
+   107→        </button>
+   108→      </div>
+   109→    </header>
+   110→  );
+   111→}
+   112→
+   113→/* ------------------------------------------------------------------ */
+   114→/* downloader                                                          */
+   115→/* ------------------------------------------------------------------ */
+   116→
+   117→function Downloader() {
+   118→  const dl = useDownloader();
+   119→  const [audioMode, setAudioMode] = useState(false);
+   120→  const [audioFmt, setAudioFmt] = useState("M4A");
+   121→  const [quality, setQuality] = useState("1080p");
+   122→  const [codec, setCodec] = useState("H.264 (AVC)");
+   123→  const [mp3Bitrate, setMp3Bitrate] = useState(320);
+   124→
+   125→  const analyze = useCallback(() => {
+   126→    if (dl.url.trim()) void dl.fetchInfo(dl.url);
+   127→  }, [dl]);
+   128→
+   129→  const info = dl.info;
+   130→
+   131→  return (
+   132→    <main className="wrap">
+   133→      {/* ---------------- url card ---------------- */}
+   134→      <section className="card url-card">
+   135→        <div className="input-row">
+   136→          <div className="url-input">
+   137→            <span className="link-ico">🔗</span>
+   138→            <input
+   139→              value={dl.url}
+   140→              onChange={(e) => dl.setUrl(e.target.value)}
+   141→              onKeyDown={(e) => {
+   142→                if (e.key === "Enter") analyze();
+   143→              }}
+   144→              placeholder="Paste YouTube link…"
+   145→              aria-label="YouTube URL"
+   146→              dir="ltr"
+   147→              spellCheck={false}
+   148→            />
+   149→          </div>
+   150→          <button className="btn primary" onClick={analyze} disabled={dl.phase === "loading" || !dl.url.trim()}>
+   151→            {dl.phase === "loading" ? "Fetching…" : "Fetch"}
+   152→          </button>
+   153→        </div>
+   154→        {dl.phase === "loading" && dl.pendingNote && (
+   155→          <div className="alert info" role="status" aria-live="polite">{dl.pendingNote}</div>
+   156→        )}
+   157→        {dl.phase === "error" && dl.errorMsg && <div className="alert err">{dl.errorMsg}</div>}
+   158→      </section>
+   159→
+   160→      {/* ---------------- video panel ---------------- */}
+   161→      {info && (
+   162→        <VideoPanel
+   163→          info={info}
+   164→          audioMode={audioMode}
+   165→          setAudioMode={setAudioMode}
+   166→          quality={quality}
+   167→          setQuality={setQuality}
+   168→          codec={codec}
+   169→          setCodec={setCodec}
+   170→          audioFmt={audioFmt}
+   171→          setAudioFmt={setAudioFmt}
+   172→          mp3Bitrate={mp3Bitrate}
+   173→          setMp3Bitrate={setMp3Bitrate}
+   174→          onStart={(fmt, bitrate) => {
+   175→            void dl.startDownload(fmt, info, bitrate);
+   176→          }}
+   177→          onDirectLink={(fmt, bitrate) => {
+   178→            void dl.getDirectLink(fmt, info, bitrate);
+   179→          }}
+   180→        />
+   181→      )}
+   182→
+   183→      {/* ---------------- jobs ---------------- */}
+   184→      <JobsList items={dl.items} onCancel={dl.cancelItem} onRemove={dl.removeItem} onClearFinished={dl.clearFinished} />
+   185→    </main>
+   186→  );
+   187→}
+   188→
+   189→/* ------------------------------------------------------------------ */
+   190→/* video panel (quality tiles + codec chips + audio segments)          */
+   191→/* ------------------------------------------------------------------ */
+   192→
+   193→interface VideoPanelProps {
+   194→  info: PublicInfo;
+   195→  audioMode: boolean;
+   196→  setAudioMode: (v: boolean) => void;
+   197→  quality: string;
+   198→  setQuality: (q: string) => void;
+   199→  codec: string;
+   200→  setCodec: (c: string) => void;
+   201→  audioFmt: string;
+   202→  setAudioFmt: (a: string) => void;
+   203→  mp3Bitrate: number;
+   204→  setMp3Bitrate: (b: number) => void;
+   205→  onStart: (fmt: PublicFormat, bitrate?: number) => void;
+   206→  onDirectLink: (fmt: PublicFormat, bitrate?: number) => void;
+   207→}
+   208→
+   209→function VideoPanel(p: VideoPanelProps) {
+   210→  const { info } = p;
+   211→  const vids = info.videoFormats ?? [];
+   212→  const auds = info.audioFormats ?? [];
+   213→
+   214→  /* keep selection valid when a new video arrives */
+   215→  useEffect(() => {
+   216→    const heights = new Set(vids.map(fmtHeight));
+   217→    if (!heights.has(qualityHeight(p.quality))) {
+   218→      const best = [...heights].sort((a, b) => b - a).find((h) => h <= 1080) ?? [...heights][0];
+   219→      if (best) p.setQuality(`${best}p`);
+   220→    }
+   221→  }, [info.infoId]);
+   222→
+   223→  const selHeight = qualityHeight(p.quality);
+   224→
+   225→  /* ---------- video selection ---------- */
+   226→  const atHeight = useMemo(() => vids.filter((f) => fmtHeight(f) === selHeight), [vids, selHeight]);
+   227→  const codecAvailable = useMemo(() => {
+   228→    const set = new Set<string>();
+   229→    for (const f of vids) {
+   230→      const c = fmtCodec(f);
+   231→      if (c) set.add(c);
+   232→    }
+   233→    return set;
+   234→  }, [vids]);
+   235→  const pick = useCallback(
+   236→    (wantCodec: string) => {
+   237→      const exact = atHeight.find((f) => fmtCodec(f) === wantCodec);
+   238→      if (exact) return exact;
+   239→      const anyAt = atHeight[0];
+   240→      if (anyAt) return anyAt;
+   241→      const lower = vids
+   242→        .filter((f) => fmtHeight(f) < selHeight && fmtCodec(f) === wantCodec)
+   243→        .sort((a, b) => fmtHeight(b) - fmtHeight(a));
+   244→      return lower[0] ?? vids.sort((a, b) => fmtHeight(b) - fmtHeight(a))[0] ?? null;
+   245→    },
+   246→    [atHeight, selHeight, vids],
+   247→  );
+   248→  const chosen = useMemo(() => pick(p.codec), [pick, p.codec]);
+   249→
+   250→  /* ---------- audio selection ---------- */
+   251→  const audioPick = useCallback(
+   252→    (name: string): PublicFormat | null => {
+   253→      if (name === "M4A") {
+   254→        const native = auds.find((a) => a.container === "m4a");
+   255→        return native ?? { id: "convert", kind: "audio", quality: "Audio", container: "m4a", instant: false, needsMerge: false };
+   256→      }
+   257→      if (name === "Opus") {
+   258→        const native = auds.find((a) => a.container === "webm" || a.container === "opus");
+   259→        return native ?? { id: "convert", kind: "audio", quality: "Audio", container: "opus", instant: false, needsMerge: false };
+   260→      }
+   261→      if (name === "MP3")
+   262→        return { id: "convert", kind: "audio", quality: "Audio", container: "mp3", instant: false, needsMerge: false };
+   263→      if (name === "FLAC")
+   264→        return { id: "convert", kind: "audio", quality: "Audio", container: "flac", instant: false, needsMerge: false };
+   265→      if (name === "WAV")
+   266→        return { id: "convert", kind: "audio", quality: "Audio", container: "wav", instant: false, needsMerge: false };
+   267→      return null;
+   268→    },
+   269→    [auds],
+   270→  );
+   271→
+   272→  const audioChosen = audioPick(p.audioFmt);
+   273→  const containers = useMemo(() => {
+   274→    const set = new Set<string>();
+   275→    for (const f of vids) set.add(f.container);
+   276→    if (set.size === 0) set.add("mp4");
+   277→    return [...set].join(" · ");
+   278→  }, [vids]);
+   279→
+   280→  const download = () => {
+   281→    if (p.audioMode) {
+   282→      if (audioChosen) p.onStart(audioChosen, p.audioFmt === "MP3" ? p.mp3Bitrate : undefined);
+   283→    } else if (chosen) {
+   284→      p.onStart(chosen);
+   285→    }
+   286→  };
+   287→
+   288→  const disabled = p.audioMode ? !audioChosen : !chosen;
+   289→
+   290→  return (
+   291→    <section className="card video-card">
+   292→      <div className="video-head">
+   293→        <div className="thumb">
+   294→          <img src={info.thumbnail} alt={info.title} />
+   295→        </div>
+   296→        <div className="vp-info">
+   297→          <div className="vp-title">{info.title}</div>
+   298→          <div className="vp-sub">
+   299→            {info.author} · {fmtDuration(info.duration)}
+   300→            {info.views ? ` · ${info.views.toLocaleString("en-US")} views` : ""}
+   301→          </div>
+   302→        </div>
+   303→      </div>
+   304→
+   305→      <div className="seg-row">
+   306→        <button className={"seg" + (!p.audioMode ? " active" : "")} onClick={() => p.setAudioMode(false)}>
+   307→          Video
+   308→        </button>
+   309→        <button className={"seg" + (p.audioMode ? " active" : "")} onClick={() => p.setAudioMode(true)}>
+   310→          Audio
+   311→        </button>
+   312→      </div>
+   313→
+   314→      {!p.audioMode ? (
+   315→        <>
+   316→          <div className="quality-grid">
+   317→            {QUALITIES.map((q) => {
+   318→              const h = qualityHeight(q);
+   319→              const has = vids.some((f) => fmtHeight(f) === h);
+   320→              return (
+   321→                <button
+   322→                  key={q}
+   323→                  className={"quality-tile" + (p.quality === q ? " active" : "")}
+   324→                  onClick={() => setQualityLocal(p, q)}
+   325→                  disabled={!has}
+   326→                >
+   327→                  {q}
+   328→                </button>
+   329→              );
+   330→            })}
+   331→          </div>
+   332→          <div className="codec-row">
+   333→            {CODECS.map((c) => (
+   334→              <button
+   335→                key={c}
+   336→                className={"chip" + (p.codec === c ? " active" : "")}
+   337→                onClick={() => p.setCodec(c)}
+   338→                disabled={!codecAvailable.has(c)}
+   339→              >
+   340→                {c}
+   341→              </button>
+   342→            ))}
+   343→          </div>
+   344→        </>
+   345→      ) : (
+   346→        <>
+   347→          <div className="seg-list audio-list">
+   348→            {AUDIO.map((a) => (
+   349→              <button
+   350→                key={a}
+   351→                className={"seg" + (p.audioFmt === a ? " active" : "")}
+   352→                onClick={() => p.setAudioFmt(a)}
+   353→              >
+   354→                {a}
+   355→              </button>
+   356→            ))}
+   357→          </div>
+   358→          {p.audioFmt === "MP3" && (
+   359→            <div className="codec-row">
+   360→              {MP3_BITRATES.map((b) => (
+   361→                <button
+   362→                  key={b}
+   363→                  className={"chip" + (p.mp3Bitrate === b ? " active" : "")}
+   364→                  onClick={() => p.setMp3Bitrate(b)}
+   365→                >
+   366→                  {b} kbps
+   367→                </button>
+   368→              ))}
+   369→            </div>
+   370→          )}
+   371→        </>
+   372→      )}
+   373→
+   374→      <div className="meta-row">
+   375→        <span className="muted">Container</span> {containers}
+   376→      </div>
+   377→
+   378→      <div className="dl-row">
+   379→        <button className="btn primary big" onClick={download} disabled={disabled} style={{ flex: 1 }}>
+   380→          Download
+   381→        </button>
+   382→        <button
+   383→          className="btn ghost big"
+   384→          style={{ width: "auto", padding: "0 16px", whiteSpace: "nowrap" }}
+   385→          disabled={disabled}
+   386→          onClick={() => {
+   387→            const fmt = p.audioMode ? audioChosen : chosen;
+   388→            if (!fmt) return;
+   389→            p.onDirectLink(fmt, p.audioFmt === "MP3" ? p.mp3Bitrate : undefined);
+   390→          }}
+   391→        >
+   392→          🔗 Direct link
+   393→        </button>
+   394→      </div>
+   395→      <div className="hint" style={{ marginTop: 8, textAlign: "center" }}>
+   396→        Direct link = the file downloaded to this server first, then you download it from here —
+   397→        resumable, no YouTube involved. Works in IDM / aria2 / any browser.
+   398→      </div>
+   399→    </section>
+   400→  );
+   401→}
+   402→
+   403→/** quality click also snaps the codec chip to one available at that height */
+   404→function setQualityLocal(p: VideoPanelProps, q: string) {
+   405→  p.setQuality(q);
+   406→  const h = qualityHeight(q);
+   407→  const at = p.info.videoFormats.filter((f) => fmtHeight(f) === h);
+   408→  if (at.length && !at.some((f) => fmtCodec(f) === p.codec)) {
+   409→    const c = fmtCodec(at[0]);
+   410→    if (c) p.setCodec(c);
+   411→  }
+   412→}
+   413→
+   414→/* ------------------------------------------------------------------ */
+   415→/* jobs list                                                           */
+   416→/* ------------------------------------------------------------------ */
+   417→
+   418→function JobsList({
+   419→  items,
+   420→  onCancel,
+   421→  onRemove,
+   422→  onClearFinished,
+   423→}: {
+   424→  items: DownloadItem[];
+   425→  onCancel: (item: DownloadItem) => void;
+   426→  onRemove: (id: string) => void;
+   427→  onClearFinished: () => void;
+   428→}) {
+   429→  if (items.length === 0) {
+   430→    return (
+   431→      <section className="card">
+   432→        <div className="jobs-empty">No downloads yet — fetch a link and pick a quality above.</div>
+   433→      </section>
+   434→    );
+   435→  }
+   436→  const finished = items.every((it) => ["done", "error", "cancelled"].includes(it.state));
+   437→  return (
+   438→    <section className="card">
+   439→      <div className="settings-head">
+   440→        <div className="settings-title" style={{ fontSize: 14 }}>
+   441→          Downloads
+   442→        </div>
+   443→        {finished && (
+   444→          <button className="x-btn" onClick={onClearFinished}>
+   445→            Clear finished
+   446→          </button>
+   447→        )}
+   448→      </div>
+   449→      <div className="jobs-scroll">
+   450→        {items.map((it) => (
+   451→          <JobRow key={it.id} it={it} onCancel={onCancel} onRemove={onRemove} />
+   452→        ))}
+   453→      </div>
+   454→    </section>
+   455→  );
+   456→}
+   457→
+   458→function JobRow({
+   459→  it,
+   460→  onCancel,
+   461→  onRemove,
+   462→}: {
+   463→  it: DownloadItem;
+   464→  onCancel: (item: DownloadItem) => void;
+   465→  onRemove: (id: string) => void;
+   466→}) {
+   467→  const working = ["starting", "queued", "downloading", "merging", "saving"].includes(it.state);
+   468→  const pct = it.total > 0 ? Math.min(100, Math.round((it.received / it.total) * 100)) : it.state === "done" ? 100 : 0;
+   469→  let badge = "";
+   470→  let badgeCls = "ok";
+   471→  if (it.state === "done") {
+   472→    badge = "Ready";
+   473→    badgeCls = "ok";
+   474→  } else if (it.state === "error") {
+   475→    badge = "Failed";
+   476→    badgeCls = "err";
+   477→  } else if (it.state === "cancelled") {
+   478→    badge = "Cancelled";
+   479→    badgeCls = "err";
+   480→  } else if (it.state === "merging") {
+   481→    badge = "Merging";
+   482→    badgeCls = "warn";
+   483→  } else if (it.state === "queued" || it.state === "starting") {
+   484→    badge = "Starting";
+   485→    badgeCls = "warn";
+   486→  } else {
+   487→    badge = `${pct}%`;
+   488→    badgeCls = "warn";
+   489→  }
+   490→
+   491→  const sub = [
+   492→    it.label,
+   493→    it.total > 0 ? fmtBytes(it.total) : "",
+   494→    working && it.speed > 0 ? `${fmtBytes(it.speed)}/s` : "",
+   495→  ]
+   496→    .filter(Boolean)
+   497→    .join(" · ");
+   498→
+   499→  return (
+   500→    <div className="job-row">
+   501→      <div style={{ minWidth: 0 }}>
+   502→        <div className="job-title">{it.title}</div>
+   503→        <div className="job-sub">{sub}</div>
+   504→        {it.directLink && (
+   505→          <button
+   506→            className="x-btn"
+   507→            style={{ marginTop: 4 }}
+   508→            onClick={() => {
+   509→              const abs = `${window.location.origin}${it.directLink}`;
+   510→              void navigator.clipboard?.writeText(abs).catch(() => undefined);
+   511→              if (it.directReady) {
+   512→                toast.success("Direct link copied", {
+   513→                  description: "The file is stored on the YouWee server — this link downloads it from here with full resume support (IDM, aria2, any browser).",
+   514→                });
+   515→              } else {
+   516→                toast.info("Fetch-first link copied", {
+   517→                  description: "The server downloads the file first; your download manager will retry automatically and land on the finished file.",
+   518→                });
+   519→              }
+   520→            }}
+   521→          >
+   522→            🔗 {it.directReady ? "Copy direct link" : "Copy fetch link"}
+   523→          </button>
+   524→        )}
+   525→      </div>
+   526→      <div className="job-right">
+   527→        <span className={"badge " + badgeCls}>{badge}</span>
+   528→        {working ? (
+   529→          <button className="x-btn" onClick={() => onCancel(it)}>
+   530→            Cancel
+   531→          </button>
+   532→        ) : (
+   533→          <button className="x-btn" onClick={() => onRemove(it.id)}>
+   534→            ✕
+   535→          </button>
+   536→        )}
+   537→      </div>
+   538→      {working && (
+   539→        <div className="job-prog">
+   540→          <div className="progress outer">
+   541→            <div className="progress inner" style={{ width: `${Math.max(2, pct)}%` }} />
+   542→          </div>
+   543→        </div>
+   544→      )}
+   545→    </div>
+   546→  );
+   547→}
+   548→
+   549→/* ------------------------------------------------------------------ */
+   550→/* settings overlay                                                    */
+   551→/* ------------------------------------------------------------------ */
+   552→
+   553→function Settings({ onClose }: { onClose: () => void }) {
+   554→  const [proxies, setProxies] = useState("");
+   555→  const [cookies, setCookies] = useState("");
+   556→  const [hasCookies, setHasCookies] = useState(false);
+   557→  const [lanes, setLanes] = useState<{ id: string; label: string; healthy: boolean; active: boolean; egressIp?: string | null; note?: string }[]>([]);
+   558→  const [saving, setSaving] = useState(false);
+   559→  const [saved, setSaved] = useState(false);
+   560→
+   561→  useEffect(() => {
+   562→    void (async () => {
+   563→      try {
+   564→        const res = await fetch("/api/settings");
+   565→        const j = await res.json();
+   566→        setProxies(j.extraProxies ?? "");
+   567→        setHasCookies(Boolean(j.cookiesConfigured));
+   568→        setLanes(j.lanes ?? []);
+   569→      } catch {
+   570→        /* overlay still renders */
+   571→      }
+   572→    })();
+   573→  }, []);
+   574→
+   575→  const save = async () => {
+   576→    setSaving(true);
+   577→    setSaved(false);
+   578→    try {
+   579→      const res = await fetch("/api/settings", {
+   580→        method: "POST",
+   581→        headers: { "Content-Type": "application/json" },
+   582→        body: JSON.stringify({ extraProxies: proxies, ...(cookies.trim() ? { cookies } : {}) }),
+   583→      });
+   584→      if (res.ok) {
+   585→        setSaved(true);
+   586→        setCookies("");
+   587→        const j = await fetch("/api/settings").then((r) => r.json());
+   588→        setLanes(j.lanes ?? []);
+   589→        setHasCookies(Boolean(j.cookiesConfigured));
+   590→        setTimeout(() => setSaved(false), 2200);
+   591→      }
+   592→    } finally {
+   593→      setSaving(false);
+   594→    }
+   595→  };
+   596→
+   597→  const active = lanes.find((l) => l.active);
+   598→
+   599→  return (
+   600→    <div className="settings-overlay" onClick={onClose} role="dialog" aria-modal="true" aria-label="Settings">
+   601→      <div className="settings-card" onClick={(e) => e.stopPropagation()}>
+   602→        <div className="settings-head">
+   603→          <div className="settings-title">Settings</div>
+   604→          <button className="icon-btn" onClick={onClose} aria-label="Close settings">
+   605→            ✕
+   606→          </button>
+   607→        </div>
+   608→
+   609→        <div className="field">
+   610→          <div className="lane-note">
+   611→            <span className={"lane-dot" + (active?.healthy ? " ok" : "")} />
+   612→            <span>
+   613→              Egress lane: <b style={{ color: "var(--text)" }}>{active?.label ?? "…"}</b>
+   614→              {active?.healthy ? " · healthy" : " · probing…"}
+   615→              {active?.egressIp ? ` · ${active.egressIp}` : ""}
+   616→            </span>
+   617→          </div>
+   618→          <div className="hint">
+   619→            The engine routes YouTube traffic through a Cloudflare WARP tunnel to bypass datacenter-IP bot walls.
+   620→            User proxies are used as fallback lanes.
+   621→          </div>
+   622→        </div>
+   623→
+   624→        <div className="field">
+   625→          <label htmlFor="yw-proxies">Extra proxies (one per line)</label>
+   626→          <textarea
+   627→            id="yw-proxies"
+   628→            rows={3}
+   629→            dir="ltr"
+   630→            spellCheck={false}
+   631→            value={proxies}
+   632→            onChange={(e) => setProxies(e.target.value)}
+   633→            placeholder={"http://user:pass@host:port\nsocks5://host:1080"}
+   634→          />
+   635→          <div className="hint">http / socks4 / socks5. Used when the WARP tunnel is unhealthy.</div>
+   636→        </div>
+   637→
+   638→        <div className="field">
+   639→          <label htmlFor="yw-cookies">YouTube cookies.txt {hasCookies ? "· configured ✓" : ""}</label>
+   640→          <textarea
+   641→            id="yw-cookies"
+   642→            rows={4}
+   643→            dir="ltr"
+   644→            spellCheck={false}
+   645→            value={cookies}
+   646→            onChange={(e) => setCookies(e.target.value)}
+   647→            placeholder="# Netscape HTTP Cookie File … (optional — permanent fix for hard-flagged IPs)"
+   648→          />
+   649→          <div className="hint">
+   650→            Export cookies.txt from a signed-in browser (privacy: stored server-side, mode 0600). Optional — the
+   651→            tunnel + PO tokens usually suffice.
+   652→          </div>
+   653→        </div>
+   654→
+   655→        <div className="settings-actions">
+   656→          <button className="btn ghost" onClick={onClose}>
+   657→            Close
+   658→          </button>
+   659→          <button className="btn primary" onClick={() => void save()} disabled={saving}>
+   660→            {saving ? "Saving…" : saved ? "Saved ✓" : "Save"}
+   661→          </button>
+   662→        </div>
+   663→      </div>
+   664→    </div>
+   665→  );
+   666→}
+   667→
+   668→/* ------------------------------------------------------------------ */
+   669→/* history overlay                                                     */
+   670→/* ------------------------------------------------------------------ */
+   671→
+   672→function History({ onClose }: { onClose: () => void }) {
+   673→  const dl = useDownloader();
+   674→  const entries = dl.history;
+   675→
+   676→  return (
+   677→    <div className="history-overlay" onClick={onClose} role="dialog" aria-modal="true" aria-label="History">
+   678→      <div className="history-card" onClick={(e) => e.stopPropagation()}>
+   679→        <div className="settings-head">
+   680→          <div className="settings-title">History</div>
+   681→          <div style={{ display: "flex", gap: 8 }}>
+   682→            {entries.length > 0 && (
+   683→              <button className="x-btn" onClick={dl.clearHistory}>
+   684→                Clear all
+   685→              </button>
+   686→            )}
+   687→            <button className="icon-btn" onClick={onClose} aria-label="Close history">
+   688→              ✕
+   689→            </button>
+   690→          </div>
+   691→        </div>
+   692→        {entries.length === 0 ? (
+   693→          <div className="jobs-empty">Nothing here yet — finished downloads land in history.</div>
+   694→        ) : (
+   695→          entries.map((h) => (
+   696→            <div
+   697→              key={h.id}
+   698→              className="hist-item"
+   699→              onClick={() => {
+   700→                if (h.videoUrl) {
+   701→                  dl.setUrl(h.videoUrl);
+   702→                  void dl.fetchInfo(h.videoUrl);
+   703→                }
+   704→                onClose();
+   705→              }}
+   706→            >
+   707→              <img className="hist-thumb" src={h.thumb} alt="" />
+   708→              <div className="hist-info">
+   709→                <div className="job-title">{h.title}</div>
+   710→                <div className="job-sub">
+   711→                  {h.label} · {h.ext.toUpperCase()}
+   712→                  {h.size ? ` · ${fmtBytes(h.size)}` : ""}
+   713→                </div>
+   714→              </div>
+   715→              <div className="hist-actions">
+   716→                {h.directUrl && (
+   717→                  <button
+   718→                    className="x-btn"
+   719→                    title="Copy direct link (stored on the server)"
+   720→                    onClick={(e) => {
+   721→                      e.stopPropagation();
+   722→                      const abs = `${window.location.origin}${h.directUrl}`;
+   723→                      void navigator.clipboard?.writeText(abs).catch(() => undefined);
+   724→                      toast.success("Direct link copied", {
+   725→                        description: "The stored file downloads from this server with full resume support.",
+   726→                      });
+   727→                    }}
+   728→                  >
+   729→                    🔗
+   730→                  </button>
+   731→                )}
+   732→                <button
+   733→                  className="x-btn"
+   734→                  title="Fetch again"
+   735→                  onClick={(e) => e.stopPropagation()}
+   736→                >
+   737→                  ↻
+   738→                </button>
+   739→              </div>
+   740→            </div>
+   741→          ))
+   742→        )}
+   743→      </div>
+   744→    </div>
+   745→  );
+   746→}
+   747→

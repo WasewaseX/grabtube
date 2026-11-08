@@ -1,0 +1,301 @@
+     1→
+     2→Scanned `src/components`: 18 blocking / 233 advisory finding(s).
+     3→Blocking score **27**, advisory score 234 (advisory findings never fail a build).
+     4→
+     5→**Slop score 67/100 - grade F - INFLATED** (0.6x worst file + 0.4x mean file deficit).
+     6→
+     7→| Rule | Findings | Severity |
+     8→|---|---|---|
+     9→| phantom-import | 219 | advisory |
+    10→| god-function | 11 | blocking |
+    11→| unused-declaration | 8 | advisory |
+    12→| bloat-long-file | 3 | blocking |
+    13→| boilerplate-duplication | 3 | blocking |
+    14→| ui-glass-glow | 2 | advisory |
+    15→| emoji-comments | 1 | blocking |
+    16→| prose-block | 1 | advisory |
+    17→| ui-gradient-text | 1 | advisory |
+    18→| ui-identical-cards | 1 | advisory |
+    19→| missing-tests | 1 | advisory |
+    20→
+    21→### Fix these first
+    22→
+    23→1. `src/components/app/app.tsx:17` [boilerplate-duplication] identical line repeated 19x: /* ---------------------------------------------------------... -> Extract the repeated lines into a shared helper
+    24→2. `src/components/app/downloads-tab.tsx:10` [boilerplate-duplication] identical line repeated 14x: import { useLang } from "@/hooks/use-lang";... -> Extract the repeated lines into a shared helper
+    25→3. `src/components/downloader/header.tsx:104` [boilerplate-duplication] identical line repeated 13x: <span className="flex items-center gap-1.5">... -> Extract the repeated lines into a shared helper
+    26→4. `src/components/app/app.tsx:3` [emoji-comments] emoji in code comments (1x) -> Remove decorative emoji from code comments
+    27→5. `src/components/app/app.tsx:1` [bloat-long-file] file spans 692 non-blank lines (budget 400) -> Split the file by responsibility; ask for the version that does the same job in fewer lines
+    28→
+    29→### Blocking findings
+    30→
+    31→| Check | Where | Detail | Weight | Fix |
+    32→|---|---|---|---|---|
+    33→| emoji-comments | `src/components/app/app.tsx:3` | emoji in code comments (1x) | 1 | Remove decorative emoji from code comments |
+    34→| bloat-long-file | `src/components/app/app.tsx:1` | file spans 692 non-blank lines (budget 400) | 1 | Split the file by responsibility; ask for the version that does the same job in fewer lines |
+    35→| god-function | `src/components/app/app.tsx:209` | function block spans 193 lines | 1 | Split the function along its responsibilities |
+    36→| god-function | `src/components/app/app.tsx:553` | function block spans 114 lines | 1 | Split the function along its responsibilities |
+    37→| bloat-long-file | `src/components/app/home-tab.tsx:1` | file spans 463 non-blank lines (budget 400) | 1 | Split the file by responsibility; ask for the version that does the same job in fewer lines |
+    38→| god-function | `src/components/app/home-tab.tsx:42` | function block spans 84 lines | 1 | Split the function along its responsibilities |
+    39→| god-function | `src/components/app/home-tab.tsx:223` | function block spans 173 lines | 1 | Split the function along its responsibilities |
+    40→| god-function | `src/components/app/settings-tab.tsx:48` | function block spans 218 lines | 1 | Split the function along its responsibilities |
+    41→| god-function | `src/components/downloader/app.tsx:68` | function block spans 130 lines | 1 | Split the function along its responsibilities |
+    42→| god-function | `src/components/downloader/format-tabs.tsx:16` | function block spans 119 lines | 1 | Split the function along its responsibilities |
+    43→| god-function | `src/components/downloader/jobs-list.tsx:64` | function block spans 143 lines | 1 | Split the function along its responsibilities |
+    44→| god-function | `src/components/downloader/queue-panel.tsx:46` | function block spans 108 lines | 1 | Split the function along its responsibilities |
+    45→| god-function | `src/components/downloader/settings-dialog.tsx:25` | function block spans 179 lines | 1 | Split the function along its responsibilities |
+    46→| god-function | `src/components/downloader/video-panel.tsx:49` | function block spans 240 lines | 1 | Split the function along its responsibilities |
+    47→| bloat-long-file | `src/components/ui/sidebar.tsx:1` | file spans 672 non-blank lines (budget 400) | 1 | Split the file by responsibility; ask for the version that does the same job in fewer lines |
+    48→| boilerplate-duplication | `src/components/app/app.tsx:17` | identical line repeated 19x: /* ---------------------------------------------------------... | 4 | Extract the repeated lines into a shared helper |
+    49→| boilerplate-duplication | `src/components/app/downloads-tab.tsx:10` | identical line repeated 14x: import { useLang } from "@/hooks/use-lang";... | 4 | Extract the repeated lines into a shared helper |
+    50→| boilerplate-duplication | `src/components/downloader/header.tsx:104` | identical line repeated 13x: <span className="flex items-center gap-1.5">... | 4 | Extract the repeated lines into a shared helper |
+    51→
+    52→### Advisory signals (never fail a build)
+    53→
+    54→| Check | Where | Detail | Weight |
+    55→|---|---|---|---|---|
+    56→| prose-block | `src/components/app/app.tsx:3` | 7-line comment block narrates the code - keep only the non-obvious why | 1 |
+    57→| phantom-import | `src/components/app/app.tsx:10` | import 'react' is never referenced | 1 |
+    58→| phantom-import | `src/components/app/app.tsx:11` | import 'sonner' is never referenced | 1 |
+    59→| phantom-import | `src/components/app/app.tsx:12` | import '@/styles/youwee.css' is never referenced | 1 |
+    60→| phantom-import | `src/components/app/app.tsx:13` | import '@/hooks/use-downloader' is never referenced | 1 |
+    61→| phantom-import | `src/components/app/app.tsx:14` | import '@/hooks/use-lang' is never referenced | 1 |
+    62→| phantom-import | `src/components/app/downloads-tab.tsx:3` | import 'lucide-react' is never referenced | 1 |
+    63→| phantom-import | `src/components/app/downloads-tab.tsx:5` | import '@/components/ui/button' is never referenced | 1 |
+    64→| phantom-import | `src/components/app/downloads-tab.tsx:6` | import '@/components/ui/progress' is never referenced | 1 |
+    65→| phantom-import | `src/components/app/downloads-tab.tsx:7` | import '@/hooks/use-downloader' is never referenced | 1 |
+    66→| phantom-import | `src/components/app/downloads-tab.tsx:8` | import '@/lib/i18n' is never referenced | 1 |
+    67→| phantom-import | `src/components/app/history-tab.tsx:3` | import 'lucide-react' is never referenced | 1 |
+    68→| phantom-import | `src/components/app/history-tab.tsx:5` | import '@/components/ui/button' is never referenced | 1 |
+    69→| phantom-import | `src/components/app/history-tab.tsx:6` | import '@/hooks/use-downloader' is never referenced | 1 |
+    70→| phantom-import | `src/components/app/history-tab.tsx:7` | import '@/lib/format-utils' is never referenced | 1 |
+    71→| phantom-import | `src/components/app/history-tab.tsx:8` | import '@/hooks/use-lang' is never referenced | 1 |
+    72→| phantom-import | `src/components/app/home-tab.tsx:4` | import 'sonner' is never referenced | 1 |
+    73→| phantom-import | `src/components/app/home-tab.tsx:5` | import 'lucide-react' is never referenced | 1 |
+    74→| phantom-import | `src/components/app/home-tab.tsx:18` | import '@/components/ui/button' is never referenced | 1 |
+    75→| phantom-import | `src/components/app/home-tab.tsx:19` | import '@/components/ui/input' is never referenced | 1 |
+    76→| phantom-import | `src/components/app/home-tab.tsx:20` | import '@/components/ui/badge' is never referenced | 1 |
+    77→| phantom-import | `src/components/app/settings-tab.tsx:4` | import 'next-themes' is never referenced | 1 |
+    78→| phantom-import | `src/components/app/settings-tab.tsx:5` | import 'lucide-react' is never referenced | 1 |
+    79→| phantom-import | `src/components/app/settings-tab.tsx:16` | import '@/components/ui/select' is never referenced | 1 |
+    80→| phantom-import | `src/components/app/settings-tab.tsx:17` | import '@/components/ui/textarea' is never referenced | 1 |
+    81→| phantom-import | `src/components/app/settings-tab.tsx:18` | import '@/components/ui/button' is never referenced | 1 |
+    82→| phantom-import | `src/components/app/tab-nav.tsx:3` | import 'lucide-react' is never referenced | 1 |
+    83→| phantom-import | `src/components/app/tab-nav.tsx:5` | import '@/hooks/use-lang' is never referenced | 1 |
+    84→| phantom-import | `src/components/app/title-bar.tsx:3` | import 'lucide-react' is never referenced | 1 |
+    85→| phantom-import | `src/components/app/title-bar.tsx:4` | import 'next-themes' is never referenced | 1 |
+    86→| phantom-import | `src/components/app/title-bar.tsx:6` | import '@/components/ui/button' is never referenced | 1 |
+    87→| phantom-import | `src/components/app/title-bar.tsx:7` | import '@/hooks/use-lang' is never referenced | 1 |
+    88→| ui-gradient-text | `src/components/downloader/app.tsx:1` | gradient clip-text headline | 1 |
+    89→| phantom-import | `src/components/downloader/app.tsx:4` | import 'framer-motion' is never referenced | 1 |
+    90→| phantom-import | `src/components/downloader/app.tsx:5` | import 'lucide-react' is never referenced | 1 |
+    91→| phantom-import | `src/components/downloader/app.tsx:7` | import '@/components/ui/button' is never referenced | 1 |
+    92→| phantom-import | `src/components/downloader/app.tsx:8` | import '@/components/ui/skeleton' is never referenced | 1 |
+    93→| phantom-import | `src/components/downloader/app.tsx:17` | import '@/hooks/use-lang' is never referenced | 1 |
+    94→| ui-glass-glow | `src/components/downloader/features.tsx:1` | 2+ backdrop-blur glass effects in one file | 1 |
+    95→| phantom-import | `src/components/downloader/features.tsx:3` | import 'framer-motion' is never referenced | 1 |
+    96→| phantom-import | `src/components/downloader/features.tsx:4` | import 'lucide-react' is never referenced | 1 |
+    97→| phantom-import | `src/components/downloader/features.tsx:5` | import '@/components/ui/accordion' is never referenced | 1 |
+    98→| phantom-import | `src/components/downloader/features.tsx:6` | import '@/hooks/use-lang' is never referenced | 1 |
+    99→| phantom-import | `src/components/downloader/footer.tsx:3` | import '@/components/ui/badge' is never referenced | 1 |
+   100→| phantom-import | `src/components/downloader/footer.tsx:4` | import '@/hooks/use-lang' is never referenced | 1 |
+   101→| phantom-import | `src/components/downloader/format-row.tsx:3` | import 'framer-motion' is never referenced | 1 |
+   102→| phantom-import | `src/components/downloader/format-row.tsx:4` | import 'lucide-react' is never referenced | 1 |
+   103→| phantom-import | `src/components/downloader/format-row.tsx:5` | import '@/components/ui/badge' is never referenced | 1 |
+   104→| phantom-import | `src/components/downloader/format-row.tsx:6` | import '@/components/ui/button' is never referenced | 1 |
+   105→| phantom-import | `src/components/downloader/format-row.tsx:7` | import '@/lib/format-utils' is never referenced | 1 |
+   106→| phantom-import | `src/components/downloader/format-tabs.tsx:4` | import 'lucide-react' is never referenced | 1 |
+   107→| phantom-import | `src/components/downloader/format-tabs.tsx:5` | import '@/components/ui/tabs' is never referenced | 1 |
+   108→| phantom-import | `src/components/downloader/format-tabs.tsx:6` | import '@/components/ui/button' is never referenced | 1 |
+   109→| phantom-import | `src/components/downloader/format-tabs.tsx:8` | import '@/lib/ytdlp' is never referenced | 1 |
+   110→| phantom-import | `src/components/downloader/format-tabs.tsx:9` | import '@/hooks/use-lang' is never referenced | 1 |
+   111→| phantom-import | `src/components/downloader/header.tsx:4` | import 'lucide-react' is never referenced | 1 |
+   112→| phantom-import | `src/components/downloader/header.tsx:5` | import '@/components/ui/button' is never referenced | 1 |
+   113→| phantom-import | `src/components/downloader/history-list.tsx:3` | import 'lucide-react' is never referenced | 1 |
+   114→| phantom-import | `src/components/downloader/history-list.tsx:4` | import '@/components/ui/button' is never referenced | 1 |
+   115→| phantom-import | `src/components/downloader/history-list.tsx:5` | import '@/lib/format-utils' is never referenced | 1 |
+   116→| phantom-import | `src/components/downloader/history-list.tsx:6` | import '@/hooks/use-downloader' is never referenced | 1 |
+   117→| phantom-import | `src/components/downloader/history-list.tsx:7` | import '@/hooks/use-lang' is never referenced | 1 |
+   118→| phantom-import | `src/components/downloader/jobs-list.tsx:3` | import 'lucide-react' is never referenced | 1 |
+   119→| phantom-import | `src/components/downloader/jobs-list.tsx:5` | import '@/components/ui/button' is never referenced | 1 |
+   120→| phantom-import | `src/components/downloader/jobs-list.tsx:6` | import '@/components/ui/progress' is never referenced | 1 |
+   121→| phantom-import | `src/components/downloader/jobs-list.tsx:7` | import '@/components/ui/scroll-area' is never referenced | 1 |
+   122→| phantom-import | `src/components/downloader/jobs-list.tsx:8` | import '@/lib/types' is never referenced | 1 |
+   123→| phantom-import | `src/components/downloader/queue-panel.tsx:3` | import 'framer-motion' is never referenced | 1 |
+   124→| phantom-import | `src/components/downloader/queue-panel.tsx:4` | import 'lucide-react' is never referenced | 1 |
+   125→| phantom-import | `src/components/downloader/queue-panel.tsx:5` | import '@/components/ui/badge' is never referenced | 1 |
+   126→| phantom-import | `src/components/downloader/queue-panel.tsx:6` | import '@/components/ui/button' is never referenced | 1 |
+   127→| phantom-import | `src/components/downloader/queue-panel.tsx:7` | import '@/components/ui/progress' is never referenced | 1 |
+   128→| phantom-import | `src/components/downloader/settings-dialog.tsx:4` | import 'lucide-react' is never referenced | 1 |
+   129→| phantom-import | `src/components/downloader/settings-dialog.tsx:5` | import '@/components/ui/dialog' is never referenced | 1 |
+   130→| phantom-import | `src/components/downloader/settings-dialog.tsx:12` | import '@/components/ui/button' is never referenced | 1 |
+   131→| phantom-import | `src/components/downloader/settings-dialog.tsx:13` | import '@/components/ui/textarea' is never referenced | 1 |
+   132→| phantom-import | `src/components/downloader/settings-dialog.tsx:14` | import '@/components/ui/input' is never referenced | 1 |
+   133→| phantom-import | `src/components/downloader/url-bar.tsx:4` | import 'lucide-react' is never referenced | 1 |
+   134→| phantom-import | `src/components/downloader/url-bar.tsx:5` | import '@/components/ui/button' is never referenced | 1 |
+   135→| phantom-import | `src/components/downloader/url-bar.tsx:6` | import '@/components/ui/input' is never referenced | 1 |
+   136→| phantom-import | `src/components/downloader/url-input.tsx:4` | import 'lucide-react' is never referenced | 1 |
+   137→| phantom-import | `src/components/downloader/url-input.tsx:5` | import '@/components/ui/button' is never referenced | 1 |
+   138→| phantom-import | `src/components/downloader/url-input.tsx:6` | import '@/components/ui/input' is never referenced | 1 |
+   139→| phantom-import | `src/components/downloader/url-input.tsx:7` | import '@/hooks/use-lang' is never referenced | 1 |
+   140→| ui-glass-glow | `src/components/downloader/video-card.tsx:1` | 2+ backdrop-blur glass effects in one file | 1 |
+   141→| phantom-import | `src/components/downloader/video-card.tsx:3` | import 'framer-motion' is never referenced | 1 |
+   142→| phantom-import | `src/components/downloader/video-card.tsx:4` | import 'lucide-react' is never referenced | 1 |
+   143→| phantom-import | `src/components/downloader/video-card.tsx:5` | import '@/components/ui/badge' is never referenced | 1 |
+   144→| phantom-import | `src/components/downloader/video-card.tsx:6` | import '@/components/ui/button' is never referenced | 1 |
+   145→| phantom-import | `src/components/downloader/video-card.tsx:7` | import '@/lib/format-utils' is never referenced | 1 |
+   146→| ui-identical-cards | `src/components/downloader/video-panel.tsx:1` | same class string repeated 5x - one template, not 5 designs | 1 |
+   147→| phantom-import | `src/components/downloader/video-panel.tsx:4` | import 'lucide-react' is never referenced | 1 |
+   148→| phantom-import | `src/components/downloader/video-panel.tsx:5` | import '@/components/ui/button' is never referenced | 1 |
+   149→| phantom-import | `src/components/downloader/video-panel.tsx:6` | import '@/components/ui/card' is never referenced | 1 |
+   150→| phantom-import | `src/components/downloader/video-panel.tsx:7` | import '@/components/ui/select' is never referenced | 1 |
+   151→| phantom-import | `src/components/downloader/video-panel.tsx:8` | import '@/components/ui/tabs' is never referenced | 1 |
+   152→| phantom-import | `src/components/theme-provider.tsx:3` | import 'next-themes' is never referenced | 1 |
+   153→| phantom-import | `src/components/ui/accordion.tsx:4` | import '@radix-ui/react-accordion' is never referenced | 1 |
+   154→| phantom-import | `src/components/ui/accordion.tsx:5` | import 'lucide-react' is never referenced | 1 |
+   155→| phantom-import | `src/components/ui/accordion.tsx:7` | import '@/lib/utils' is never referenced | 1 |
+   156→| phantom-import | `src/components/ui/alert-dialog.tsx:4` | import '@radix-ui/react-alert-dialog' is never referenced | 1 |
+   157→| phantom-import | `src/components/ui/alert-dialog.tsx:6` | import '@/lib/utils' is never referenced | 1 |
+   158→| phantom-import | `src/components/ui/alert-dialog.tsx:7` | import '@/components/ui/button' is never referenced | 1 |
+   159→| phantom-import | `src/components/ui/alert.tsx:1` | import 'react' is never referenced | 1 |
+   160→| phantom-import | `src/components/ui/alert.tsx:2` | import 'class-variance-authority' is never referenced | 1 |
+   161→| phantom-import | `src/components/ui/alert.tsx:4` | import '@/lib/utils' is never referenced | 1 |
+   162→| phantom-import | `src/components/ui/aspect-ratio.tsx:3` | import '@radix-ui/react-aspect-ratio' is never referenced | 1 |
+   163→| phantom-import | `src/components/ui/avatar.tsx:4` | import '@radix-ui/react-avatar' is never referenced | 1 |
+   164→| phantom-import | `src/components/ui/avatar.tsx:6` | import '@/lib/utils' is never referenced | 1 |
+   165→| phantom-import | `src/components/ui/badge.tsx:2` | import '@radix-ui/react-slot' is never referenced | 1 |
+   166→| phantom-import | `src/components/ui/badge.tsx:3` | import 'class-variance-authority' is never referenced | 1 |
+   167→| phantom-import | `src/components/ui/badge.tsx:5` | import '@/lib/utils' is never referenced | 1 |
+   168→| phantom-import | `src/components/ui/breadcrumb.tsx:2` | import '@radix-ui/react-slot' is never referenced | 1 |
+   169→| phantom-import | `src/components/ui/breadcrumb.tsx:3` | import 'lucide-react' is never referenced | 1 |
+   170→| phantom-import | `src/components/ui/breadcrumb.tsx:5` | import '@/lib/utils' is never referenced | 1 |
+   171→| phantom-import | `src/components/ui/button.tsx:2` | import '@radix-ui/react-slot' is never referenced | 1 |
+   172→| phantom-import | `src/components/ui/button.tsx:3` | import 'class-variance-authority' is never referenced | 1 |
+   173→| phantom-import | `src/components/ui/button.tsx:5` | import '@/lib/utils' is never referenced | 1 |
+   174→| phantom-import | `src/components/ui/calendar.tsx:4` | import 'lucide-react' is never referenced | 1 |
+   175→| phantom-import | `src/components/ui/calendar.tsx:9` | import 'react-day-picker' is never referenced | 1 |
+   176→| phantom-import | `src/components/ui/calendar.tsx:11` | import '@/lib/utils' is never referenced | 1 |
+   177→| phantom-import | `src/components/ui/calendar.tsx:12` | import '@/components/ui/button' is never referenced | 1 |
+   178→| phantom-import | `src/components/ui/card.tsx:1` | import 'react' is never referenced | 1 |
+   179→| phantom-import | `src/components/ui/card.tsx:3` | import '@/lib/utils' is never referenced | 1 |
+   180→| phantom-import | `src/components/ui/carousel.tsx:4` | import 'embla-carousel-react' is never referenced | 1 |
+   181→| phantom-import | `src/components/ui/carousel.tsx:7` | import 'lucide-react' is never referenced | 1 |
+   182→| phantom-import | `src/components/ui/carousel.tsx:9` | import '@/lib/utils' is never referenced | 1 |
+   183→| phantom-import | `src/components/ui/carousel.tsx:10` | import '@/components/ui/button' is never referenced | 1 |
+   184→| phantom-import | `src/components/ui/chart.tsx:3` | import 'react' is never referenced | 1 |
+   185→| phantom-import | `src/components/ui/chart.tsx:6` | import '@/lib/utils' is never referenced | 1 |
+   186→| phantom-import | `src/components/ui/checkbox.tsx:4` | import '@radix-ui/react-checkbox' is never referenced | 1 |
+   187→| phantom-import | `src/components/ui/checkbox.tsx:5` | import 'lucide-react' is never referenced | 1 |
+   188→| phantom-import | `src/components/ui/checkbox.tsx:7` | import '@/lib/utils' is never referenced | 1 |
+   189→| phantom-import | `src/components/ui/collapsible.tsx:3` | import '@radix-ui/react-collapsible' is never referenced | 1 |
+   190→| phantom-import | `src/components/ui/command.tsx:5` | import 'lucide-react' is never referenced | 1 |
+   191→| phantom-import | `src/components/ui/command.tsx:7` | import '@/lib/utils' is never referenced | 1 |
+   192→| phantom-import | `src/components/ui/command.tsx:8` | import '@/components/ui/dialog' is never referenced | 1 |
+   193→| phantom-import | `src/components/ui/context-menu.tsx:4` | import '@radix-ui/react-context-menu' is never referenced | 1 |
+   194→| phantom-import | `src/components/ui/context-menu.tsx:5` | import 'lucide-react' is never referenced | 1 |
+   195→| phantom-import | `src/components/ui/context-menu.tsx:7` | import '@/lib/utils' is never referenced | 1 |
+   196→| phantom-import | `src/components/ui/dialog.tsx:4` | import '@radix-ui/react-dialog' is never referenced | 1 |
+   197→| phantom-import | `src/components/ui/dialog.tsx:5` | import 'lucide-react' is never referenced | 1 |
+   198→| phantom-import | `src/components/ui/dialog.tsx:7` | import '@/lib/utils' is never referenced | 1 |
+   199→| phantom-import | `src/components/ui/drawer.tsx:3` | import 'react' is never referenced | 1 |
+   200→| phantom-import | `src/components/ui/drawer.tsx:6` | import '@/lib/utils' is never referenced | 1 |
+   201→| phantom-import | `src/components/ui/dropdown-menu.tsx:4` | import '@radix-ui/react-dropdown-menu' is never referenced | 1 |
+   202→| phantom-import | `src/components/ui/dropdown-menu.tsx:5` | import 'lucide-react' is never referenced | 1 |
+   203→| phantom-import | `src/components/ui/dropdown-menu.tsx:7` | import '@/lib/utils' is never referenced | 1 |
+   204→| phantom-import | `src/components/ui/form.tsx:4` | import '@radix-ui/react-label' is never referenced | 1 |
+   205→| phantom-import | `src/components/ui/form.tsx:5` | import '@radix-ui/react-slot' is never referenced | 1 |
+   206→| phantom-import | `src/components/ui/form.tsx:6` | import 'react-hook-form' is never referenced | 1 |
+   207→| phantom-import | `src/components/ui/form.tsx:16` | import '@/lib/utils' is never referenced | 1 |
+   208→| phantom-import | `src/components/ui/form.tsx:17` | import '@/components/ui/label' is never referenced | 1 |
+   209→| phantom-import | `src/components/ui/hover-card.tsx:4` | import '@radix-ui/react-hover-card' is never referenced | 1 |
+   210→| phantom-import | `src/components/ui/hover-card.tsx:6` | import '@/lib/utils' is never referenced | 1 |
+   211→| phantom-import | `src/components/ui/input-otp.tsx:5` | import 'lucide-react' is never referenced | 1 |
+   212→| phantom-import | `src/components/ui/input-otp.tsx:7` | import '@/lib/utils' is never referenced | 1 |
+   213→| phantom-import | `src/components/ui/input.tsx:1` | import 'react' is never referenced | 1 |
+   214→| phantom-import | `src/components/ui/input.tsx:3` | import '@/lib/utils' is never referenced | 1 |
+   215→| phantom-import | `src/components/ui/label.tsx:4` | import '@radix-ui/react-label' is never referenced | 1 |
+   216→| phantom-import | `src/components/ui/label.tsx:6` | import '@/lib/utils' is never referenced | 1 |
+   217→| phantom-import | `src/components/ui/menubar.tsx:4` | import '@radix-ui/react-menubar' is never referenced | 1 |
+   218→| phantom-import | `src/components/ui/menubar.tsx:5` | import 'lucide-react' is never referenced | 1 |
+   219→| phantom-import | `src/components/ui/menubar.tsx:7` | import '@/lib/utils' is never referenced | 1 |
+   220→| phantom-import | `src/components/ui/navigation-menu.tsx:2` | import '@radix-ui/react-navigation-menu' is never referenced | 1 |
+   221→| phantom-import | `src/components/ui/navigation-menu.tsx:3` | import 'class-variance-authority' is never referenced | 1 |
+   222→| phantom-import | `src/components/ui/navigation-menu.tsx:4` | import 'lucide-react' is never referenced | 1 |
+   223→| phantom-import | `src/components/ui/navigation-menu.tsx:6` | import '@/lib/utils' is never referenced | 1 |
+   224→| phantom-import | `src/components/ui/pagination.tsx:2` | import 'lucide-react' is never referenced | 1 |
+   225→| phantom-import | `src/components/ui/pagination.tsx:8` | import '@/lib/utils' is never referenced | 1 |
+   226→| phantom-import | `src/components/ui/pagination.tsx:9` | import '@/components/ui/button' is never referenced | 1 |
+   227→| phantom-import | `src/components/ui/popover.tsx:4` | import '@radix-ui/react-popover' is never referenced | 1 |
+   228→| phantom-import | `src/components/ui/popover.tsx:6` | import '@/lib/utils' is never referenced | 1 |
+   229→| phantom-import | `src/components/ui/progress.tsx:4` | import '@radix-ui/react-progress' is never referenced | 1 |
+   230→| phantom-import | `src/components/ui/progress.tsx:6` | import '@/lib/utils' is never referenced | 1 |
+   231→| phantom-import | `src/components/ui/radio-group.tsx:4` | import '@radix-ui/react-radio-group' is never referenced | 1 |
+   232→| phantom-import | `src/components/ui/radio-group.tsx:5` | import 'lucide-react' is never referenced | 1 |
+   233→| phantom-import | `src/components/ui/radio-group.tsx:7` | import '@/lib/utils' is never referenced | 1 |
+   234→| phantom-import | `src/components/ui/resizable.tsx:4` | import 'lucide-react' is never referenced | 1 |
+   235→| phantom-import | `src/components/ui/resizable.tsx:5` | import 'react-resizable-panels' is never referenced | 1 |
+   236→| phantom-import | `src/components/ui/resizable.tsx:7` | import '@/lib/utils' is never referenced | 1 |
+   237→| phantom-import | `src/components/ui/scroll-area.tsx:4` | import '@radix-ui/react-scroll-area' is never referenced | 1 |
+   238→| phantom-import | `src/components/ui/scroll-area.tsx:6` | import '@/lib/utils' is never referenced | 1 |
+   239→| phantom-import | `src/components/ui/select.tsx:4` | import '@radix-ui/react-select' is never referenced | 1 |
+   240→| phantom-import | `src/components/ui/select.tsx:5` | import 'lucide-react' is never referenced | 1 |
+   241→| phantom-import | `src/components/ui/select.tsx:7` | import '@/lib/utils' is never referenced | 1 |
+   242→| phantom-import | `src/components/ui/separator.tsx:4` | import '@radix-ui/react-separator' is never referenced | 1 |
+   243→| phantom-import | `src/components/ui/separator.tsx:6` | import '@/lib/utils' is never referenced | 1 |
+   244→| phantom-import | `src/components/ui/sheet.tsx:4` | import '@radix-ui/react-dialog' is never referenced | 1 |
+   245→| phantom-import | `src/components/ui/sheet.tsx:5` | import 'lucide-react' is never referenced | 1 |
+   246→| phantom-import | `src/components/ui/sheet.tsx:7` | import '@/lib/utils' is never referenced | 1 |
+   247→| phantom-import | `src/components/ui/sidebar.tsx:4` | import '@radix-ui/react-slot' is never referenced | 1 |
+   248→| phantom-import | `src/components/ui/sidebar.tsx:5` | import 'class-variance-authority' is never referenced | 1 |
+   249→| phantom-import | `src/components/ui/sidebar.tsx:6` | import 'lucide-react' is never referenced | 1 |
+   250→| phantom-import | `src/components/ui/sidebar.tsx:8` | import '@/hooks/use-mobile' is never referenced | 1 |
+   251→| phantom-import | `src/components/ui/sidebar.tsx:9` | import '@/lib/utils' is never referenced | 1 |
+   252→| phantom-import | `src/components/ui/skeleton.tsx:1` | import '@/lib/utils' is never referenced | 1 |
+   253→| phantom-import | `src/components/ui/slider.tsx:4` | import '@radix-ui/react-slider' is never referenced | 1 |
+   254→| phantom-import | `src/components/ui/slider.tsx:6` | import '@/lib/utils' is never referenced | 1 |
+   255→| phantom-import | `src/components/ui/sonner.tsx:3` | import 'next-themes' is never referenced | 1 |
+   256→| phantom-import | `src/components/ui/sonner.tsx:4` | import 'sonner' is never referenced | 1 |
+   257→| phantom-import | `src/components/ui/switch.tsx:4` | import '@radix-ui/react-switch' is never referenced | 1 |
+   258→| phantom-import | `src/components/ui/switch.tsx:6` | import '@/lib/utils' is never referenced | 1 |
+   259→| phantom-import | `src/components/ui/table.tsx:3` | import 'react' is never referenced | 1 |
+   260→| phantom-import | `src/components/ui/table.tsx:5` | import '@/lib/utils' is never referenced | 1 |
+   261→| phantom-import | `src/components/ui/tabs.tsx:4` | import '@radix-ui/react-tabs' is never referenced | 1 |
+   262→| phantom-import | `src/components/ui/tabs.tsx:6` | import '@/lib/utils' is never referenced | 1 |
+   263→| phantom-import | `src/components/ui/textarea.tsx:1` | import 'react' is never referenced | 1 |
+   264→| phantom-import | `src/components/ui/textarea.tsx:3` | import '@/lib/utils' is never referenced | 1 |
+   265→| phantom-import | `src/components/ui/toast.tsx:4` | import '@radix-ui/react-toast' is never referenced | 1 |
+   266→| phantom-import | `src/components/ui/toast.tsx:5` | import 'class-variance-authority' is never referenced | 1 |
+   267→| phantom-import | `src/components/ui/toast.tsx:6` | import 'lucide-react' is never referenced | 1 |
+   268→| phantom-import | `src/components/ui/toast.tsx:8` | import '@/lib/utils' is never referenced | 1 |
+   269→| phantom-import | `src/components/ui/toaster.tsx:3` | import '@/hooks/use-toast' is never referenced | 1 |
+   270→| phantom-import | `src/components/ui/toaster.tsx:4` | import '@/components/ui/toast' is never referenced | 1 |
+   271→| phantom-import | `src/components/ui/toggle-group.tsx:4` | import '@radix-ui/react-toggle-group' is never referenced | 1 |
+   272→| phantom-import | `src/components/ui/toggle-group.tsx:5` | import 'class-variance-authority' is never referenced | 1 |
+   273→| phantom-import | `src/components/ui/toggle-group.tsx:7` | import '@/lib/utils' is never referenced | 1 |
+   274→| phantom-import | `src/components/ui/toggle-group.tsx:8` | import '@/components/ui/toggle' is never referenced | 1 |
+   275→| phantom-import | `src/components/ui/toggle.tsx:4` | import '@radix-ui/react-toggle' is never referenced | 1 |
+   276→| phantom-import | `src/components/ui/toggle.tsx:5` | import 'class-variance-authority' is never referenced | 1 |
+   277→| phantom-import | `src/components/ui/toggle.tsx:7` | import '@/lib/utils' is never referenced | 1 |
+   278→| phantom-import | `src/components/ui/tooltip.tsx:4` | import '@radix-ui/react-tooltip' is never referenced | 1 |
+   279→| phantom-import | `src/components/ui/tooltip.tsx:6` | import '@/lib/utils' is never referenced | 1 |
+   280→| unused-declaration | `src/components/app/downloads-tab.tsx:18` | 'DownloadsTab' is exported but never referenced anywhere in the repository - dead export | 1 |
+   281→| unused-declaration | `src/components/app/history-tab.tsx:14` | 'HistoryTab' is exported but never referenced anywhere in the repository - dead export | 1 |
+   282→| unused-declaration | `src/components/app/home-tab.tsx:41` | 'HomeTab' is exported but never referenced anywhere in the repository - dead export | 1 |
+   283→| unused-declaration | `src/components/app/settings-tab.tsx:47` | 'SettingsTab' is exported but never referenced anywhere in the repository - dead export | 1 |
+   284→| unused-declaration | `src/components/app/tab-nav.tsx:16` | 'TabNav' is exported but never referenced anywhere in the repository - dead export | 1 |
+   285→| unused-declaration | `src/components/app/title-bar.tsx:10` | 'TitleBar' is exported but never referenced anywhere in the repository - dead export | 1 |
+   286→| unused-declaration | `src/components/downloader/settings-dialog.tsx:24` | 'SettingsDialog' is exported but never referenced anywhere in the repository - dead export | 1 |
+   287→| unused-declaration | `src/components/downloader/url-bar.tsx:12` | 'UrlBar' is exported but never referenced anywhere in the repository - dead export | 1 |
+   288→| missing-tests | `app/app.tsx:1` | 70 source files and no test files in the repository (test inventory, advisory) | 2 |
+   289→
+   290→### Highest-deficit files
+   291→
+   292→| File | Deficit |
+   293→|---|---|
+   294→| `src/components/app/app.tsx` | 100 |
+   295→| `src/components/app/downloads-tab.tsx` | 98 |
+   296→| `src/components/downloader/header.tsx` | 92 |
+   297→| `src/components/app/home-tab.tsx` | 90 |
+   298→| `src/components/app/settings-tab.tsx` | 51 |
+   299→
+   300→Opt out per path or check via `.ai-integrity-ignore` (glob lines, or `check:<id>` to disable one rule); accept existing findings with `--write-baseline` + `--baseline`.
+   301→

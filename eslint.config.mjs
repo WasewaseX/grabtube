@@ -44,6 +44,15 @@ const eslintConfig = [...nextCoreWebVitals, ...nextTypescript, {
     "no-useless-escape": "off",
   },
 }, {
+  // Vendored shadcn/ui kit and its helper hook — maintained upstream, not
+  // first-party code. The strict react-compiler-era rules (setState inside
+  // effects for hydration-safe store reads) are intentional there.
+  files: ["src/components/ui/**", "src/hooks/use-mobile.ts"],
+  rules: {
+    "react-hooks/set-state-in-effect": "off",
+    "react-compiler/react-compiler": "off",
+  },
+}, {
   ignores: ["node_modules/**", ".next/**", "out/**", "build/**", "next-env.d.ts", "examples/**", "skills", "mini-services/**", "downloads/**"]
 }];
 

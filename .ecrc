@@ -1,0 +1,12 @@
+{
+  "Ignore": [
+    "public/demo/**",
+    "db/**",
+    "tools/**",
+    "downloads/**",
+    "node_modules/**",
+    ".next/**",
+    "bun.lock",
+    "package-lock.json"
+  ]
+}

@@ -267,6 +267,17 @@ function invToRaw(data: Record<string, unknown>, videoId?: string): RawInfo | nu
  * Per-instance results are remembered so known-good instances are retried
  * first next time (they're all re-probed cheaply here anyway).
  */
+/* A "complete" raw has at least one playable video AND one audio stream —
+ * the minimum for any real download (muxed instant or video|audio merge).
+ * Degraded instances often answer fast with a lone audio-less video stream;
+ * racing them with Promise.any would win with a useless partial result. */
+function isCompleteRaw(raw: RawInfo | null): raw is RawInfo {
+  if (!raw || raw.formats.length === 0) return false;
+  const hasVideo = raw.formats.some((f) => f.vcodec && f.vcodec !== "none" && f.url);
+  const hasAudio = raw.formats.some((f) => f.vcodec === "none" && f.acodec && f.acodec !== "none" && f.url);
+  return hasVideo && hasAudio;
+}
+
 export async function fetchViaProxies(videoId: string): Promise<RawInfo> {
   const list = instances();
   const tasks = list.map(async (inst) => {
@@ -279,15 +290,39 @@ export async function fetchViaProxies(videoId: string): Promise<RawInfo> {
     if ((data.error || data.message) && !data.formats && !data.videoStreams && !data.adaptiveFormats)
       throw new Error(`${inst.name}: ${(String(data.error || data.message) || "error").slice(0, 60)}`);
     const raw = inst.kind === "piped" ? pipedToRaw(data, videoId) : invToRaw(data, videoId);
-    if (!raw || raw.formats.length === 0) throw new Error(`${inst.name}: no formats`);
+    /* Healthy full answer → report success; a partial audio-less answer is
+     * recorded as degraded (bad) so the health memory demotes the instance. */
+    if (!isCompleteRaw(raw)) {
+      noteResult(inst.name, false);
+      throw new Error(`${inst.name}: degraded (no playable video+audio pair)`);
+    }
     noteResult(inst.name, true);
     return raw;
   });
 
+  /* Race for a COMPLETE answer; if every instance is degraded, fall back to
+   * the richest partial answer so the UI can still show what exists. */
   try {
     return await Promise.any(tasks);
   } catch {
     for (const t of tasks) void t.catch(() => undefined);
+    /* Everything degraded: best-effort short re-query of the first instances
+     * for a partial answer so the UI can still show what exists. */
+    for (const inst of list.slice(0, 3)) {
+      try {
+        const data = (await grab(
+          inst.kind === "piped"
+            ? `${inst.base}/streams/${videoId}`
+            : `${inst.base}/api/v1/videos/${videoId}`,
+          6000,
+        )) as Record<string, unknown> | null;
+        if (!data) continue;
+        const raw = inst.kind === "piped" ? pipedToRaw(data, videoId) : invToRaw(data, videoId);
+        if (raw && raw.formats.length > 0) return raw;
+      } catch {
+        /* next instance */
+      }
+    }
     throw new Error("ALL_PROVIDERS_FAILED");
   }
 }

@@ -54,10 +54,12 @@ export async function POST(req: Request) {
     body.mode === "mp3" ? "mp3" : body.mode === "file" ? "file" : "merge";
 
   try {
+    console.log("[jobs] POST body:", JSON.stringify(body));
     const input = buildInput(infoId, raw, mode, body);
     const job = createJob(input);
     return NextResponse.json({ job: publicJob(job) });
   } catch (e) {
+    console.error("[jobs] POST /api/jobs create failed:", e);
     if (e instanceof DlError) {
       const status = e.code === "EXPIRED" ? 410 : e.code === "NO_FFMPEG" ? 503 : 500;
       return NextResponse.json({ error: { code: e.code, message: e.message } }, { status });
@@ -137,7 +139,10 @@ function buildInput(
       urls: { video: video.url, audio: audio.url },
     };
   }
-  return base;
+  /* Honest failure: a merge was requested but the provider fleet cannot
+   * supply both direct streams. Answer with a real code instead of letting
+   * buildMergeArgs reject the shape with a cryptic "Bad merge request". */
+  throw new DlError("NO_FORMATS", "Provider has no compatible stream pair for this quality — fetch again to try another instance.");
 }
 
 function bestAudioFormat(formats: YtRawFormat[], container?: string): YtRawFormat | null {

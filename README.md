@@ -28,7 +28,7 @@ Most web downloaders die on three things: verification walls, mid-download failu
 
 ## Architecture
 
-```
+```text
 Browser ── Next.js App Router (port 3000)
              ├─ POST /api/info         → extract(): yt-dlp → Piped/Invidious fallback
              ├─ GET  /api/download     → instant single-format proxy stream (Range/206)
@@ -83,7 +83,7 @@ For hard-flagged networks or age-restricted videos, paste a cookies.txt (Netscap
 
 Every format row has a chain-link button that copies a permanent URL:
 
-```
+```text
 /api/dl?u=<base64url video>&f=<format>&q=<quality>&t=<title>&b=<bitrate>
 ```
 

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# GrabTube pre-commit hook — blocks commits that fail the local quality gate.
+# Installed via: git config core.hooksPath .githooks
+# (scripts/install-hooks.sh does this for you)
+set -u
+exec bash "$(git rev-parse --show-toplevel)/scripts/quality-gate.sh"

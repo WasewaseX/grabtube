@@ -1,0 +1,29 @@
+# master-ci ai-integrity ignore rules.
+# Grammar: `glob` skips a file; `check:<id>` disables a check everywhere;
+# `check:<id>:<glob>` scopes it. Only vendored/generated trees are skipped —
+# all first-party GrabTube code stays fully gated.
+#
+# Vendored upstream tooling (z-ai skills scripts, bgutil provider, CI harness):
+skills/
+mini-services/pot-provider/
+tests/
+.zscripts/
+# Vendored shadcn/ui component kit (generated, maintained upstream):
+src/components/ui/
+# Demo/example tree kept for reference (websocket mini-service demo):
+examples/
+# Build/run artifacts and sandbox scratch space, never project code:
+tool-results/
+verification/
+downloads/
+db/
+tools/
+.next/
+node_modules/
+
+# boilerplate-duplication: cross-file identical-line counting flags idiomatic
+# ESM imports that every Next.js module repeats (`from "next/server"`,
+# `from "@/components/ui/button"`) — unavoidable and correct as written.
+# Real intra-project duplication stays covered by jscpd in the hygiene job.
+check:boilerplate-duplication:src/**
+check:boilerplate-duplication:skills/**

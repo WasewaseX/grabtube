@@ -257,9 +257,7 @@ export async function ensureFileForLink(spec: LinkSpec): Promise<EnsureResult> {
   return { kind: "busy", retryAfter: 10 };
 }
 
-/* ------------------------------------------------------------------ */
 /* Local-file serving with production-grade Range support              */
-/* ------------------------------------------------------------------ */
 
 function etagFor(size: number, mtimeMs: number): string {
   return `"${size.toString(16)}-${Math.floor(mtimeMs).toString(16)}"`;

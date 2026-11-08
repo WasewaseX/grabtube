@@ -2,7 +2,7 @@
 
 import { History, House, Settings2, Download } from "lucide-react";
 
-import { useLang } from "@/hooks/use-lang";
+import { useLang } from "../../hooks/use-lang";
 
 export type TabId = "home" | "downloads" | "history" | "settings";
 

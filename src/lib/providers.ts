@@ -13,9 +13,7 @@
  */
 import type { RawInfo, YtRawFormat } from "./ytdlp";
 
-/* ------------------------------------------------------------------ */
 /* Instance registry                                                   */
-/* ------------------------------------------------------------------ */
 
 export interface Instance {
   name: string;
@@ -55,9 +53,7 @@ export function instances(): Instance[] {
   return [...BUILTIN, ...extra, ...discovered.filter((i) => !seen.has(i.base))];
 }
 
-/* ------------------------------------------------------------------ */
 /* URL → videoId                                                       */
-/* ------------------------------------------------------------------ */
 
 export function parseVideoId(url: string): string | null {
   try {
@@ -76,9 +72,7 @@ export function parseVideoId(url: string): string | null {
   }
 }
 
-/* ------------------------------------------------------------------ */
 /* fetch with timeout + UA (some instances require a browser-ish UA)   */
-/* ------------------------------------------------------------------ */
 
 async function grab(url: string, timeoutMs = 12_000): Promise<unknown | null> {
   try {
@@ -98,9 +92,7 @@ async function grab(url: string, timeoutMs = 12_000): Promise<unknown | null> {
   }
 }
 
-/* ------------------------------------------------------------------ */
 /* Shared helpers                                                      */
-/* ------------------------------------------------------------------ */
 
 function parseMime(mime?: string): { ext: string; codecs: string[] } {
   const [type, codecsPart] = (mime || "").split(";");
@@ -127,9 +119,7 @@ function codecArgs(kind: "video" | "audio", codecLabel: string): string {
   return "unknown";
 }
 
-/* ------------------------------------------------------------------ */
 /* Piped adapter                                                       */
-/* ------------------------------------------------------------------ */
 
 interface PipedStream {
   url?: string;
@@ -145,7 +135,7 @@ interface PipedStream {
   format?: string; // "MPEG_4" | "WEBM" | "M4A" | ...
 }
 
-function pipedToRaw(data: Record<string, unknown>): RawInfo | null {
+function pipedToRaw(data: Record<string, unknown>, videoId?: string): RawInfo | null {
   const videos = (data.videoStreams as PipedStream[] | undefined) || [];
   const audios = (data.audioStreams as PipedStream[] | undefined) || [];
   const formats: YtRawFormat[] = [];
@@ -187,13 +177,13 @@ function pipedToRaw(data: Record<string, unknown>): RawInfo | null {
 
   if (formats.length === 0) return null;
   return {
-    id: String(data.id || ""),
+    id: videoId || String(data.id || ""),
     title: String(data.title || "Untitled"),
     uploader: String(data.uploader || ""),
     duration: Number(data.duration || 0),
     view_count: Number(data.views || 0),
     thumbnail: String(data.thumbnailUrl || ""),
-    webpage_url: `https://www.youtube.com/watch?v=${String(data.id || "")}`,
+    webpage_url: `https://www.youtube.com/watch?v=${videoId || String(data.id || "")}`,
     is_live: !!data.livestream,
     live_status: data.livestream ? "is_live" : "not_live",
     extractor_key: "Youtube:Piped",
@@ -201,9 +191,7 @@ function pipedToRaw(data: Record<string, unknown>): RawInfo | null {
   };
 }
 
-/* ------------------------------------------------------------------ */
 /* Invidious adapter                                                   */
-/* ------------------------------------------------------------------ */
 
 interface InvFormat {
   itag?: string;
@@ -219,7 +207,7 @@ interface InvFormat {
   size?: string;
 }
 
-function invToRaw(data: Record<string, unknown>): RawInfo | null {
+function invToRaw(data: Record<string, unknown>, videoId?: string): RawInfo | null {
   const fmtStreams = (data.formatStreams as InvFormat[] | undefined) || [];
   const adaptive = (data.adaptiveFormats as InvFormat[] | undefined) || [];
   const formats: YtRawFormat[] = [];
@@ -256,13 +244,13 @@ function invToRaw(data: Record<string, unknown>): RawInfo | null {
   if (formats.length === 0) return null;
   const thumbs = (data.videoThumbnails as Array<{ url?: string }> | undefined) || [];
   return {
-    id: String(data.videoId || ""),
+    id: videoId || String(data.videoId || ""),
     title: String(data.title || "Untitled"),
     uploader: String(data.author || ""),
     duration: Number(data.lengthSeconds || 0),
     view_count: Number(data.viewCount || 0),
     thumbnail: thumbs[0]?.url || "",
-    webpage_url: `https://www.youtube.com/watch?v=${String(data.videoId || "")}`,
+    webpage_url: `https://www.youtube.com/watch?v=${videoId || String(data.videoId || "")}`,
     is_live: !!data.liveNow,
     live_status: data.liveNow ? "is_live" : "not_live",
     extractor_key: "Youtube:Invidious",
@@ -270,9 +258,7 @@ function invToRaw(data: Record<string, unknown>): RawInfo | null {
   };
 }
 
-/* ------------------------------------------------------------------ */
 /* Public: fetch through the fallback chain                            */
-/* ------------------------------------------------------------------ */
 
 /**
  * Races ALL instances in parallel and returns the first healthy response.
@@ -292,7 +278,7 @@ export async function fetchViaProxies(videoId: string): Promise<RawInfo> {
     if (!data) throw new Error(`${inst.name}: no response`);
     if ((data.error || data.message) && !data.formats && !data.videoStreams && !data.adaptiveFormats)
       throw new Error(`${inst.name}: ${(String(data.error || data.message) || "error").slice(0, 60)}`);
-    const raw = inst.kind === "piped" ? pipedToRaw(data) : invToRaw(data);
+    const raw = inst.kind === "piped" ? pipedToRaw(data, videoId) : invToRaw(data, videoId);
     if (!raw || raw.formats.length === 0) throw new Error(`${inst.name}: no formats`);
     noteResult(inst.name, true);
     return raw;
@@ -306,9 +292,7 @@ export async function fetchViaProxies(videoId: string): Promise<RawInfo> {
   }
 }
 
-/* ------------------------------------------------------------------ */
 /* Health memory + fleet auto-refresh                                  */
-/* ------------------------------------------------------------------ */
 
 /** Extra instances discovered from the community fleet lists. */
 declare global {

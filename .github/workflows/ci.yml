@@ -1,0 +1,42 @@
+# GrabTube CI — powered by master-ci (WasewaseX/master-ci).
+#
+# One caller file = 100+ checks: hygiene (actionlint/zizmor/yamllint/shellcheck/
+# jscpd), full-history secret scanning, AI-integrity slop detection, Node lint
+# + types + depcheck, CodeQL, Semgrep/Trivy/OSV security, dependency review,
+# OSSF Scorecard, PR dashboard — all aggregated into the single `ci-success`
+# required check. Path-aware: jobs skip when their stack didn't change.
+#
+# Profile `strict` enforces every gate at the maximum level (AI-slop blocking
+# budgets, structural bloat budgets, duplication threshold).
+#
+# Supply-chain posture: reusable workflows pinned to an exact release tag,
+# Dependabot keeps the pins fresh (see .github/dependabot.yml).
+# Helper repo/ref pinned explicitly — this repo is a foreign caller.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  master:
+    uses: WasewaseX/master-ci/.github/workflows/master-ci.yml@v1.16.0
+    with:
+      profile: strict
+      template_repo: WasewaseX/master-ci
+      template_ref: v1.16.0
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+      id-token: write
+
+  codeql:
+    uses: WasewaseX/master-ci/.github/workflows/codeql.yml@v1.16.0
+    with:
+      languages: javascript-typescript
+    permissions:
+      contents: read
+      security-events: write

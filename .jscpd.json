@@ -1,0 +1,14 @@
+{
+  "threshold": 8,
+  "min-tokens": 120,
+  "ignore": [
+    "**/.next/**",
+    "**/node_modules/**",
+    "**/downloads/**",
+    "**/db/**",
+    "**/tools/**",
+    "**/*.min.js",
+    "**/package-lock.json",
+    "**/bun.lock"
+  ]
+}

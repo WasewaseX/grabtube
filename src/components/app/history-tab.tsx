@@ -5,7 +5,7 @@ import { ExternalLink, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { HistoryEntry } from "@/hooks/use-downloader";
 import { formatBytes } from "@/lib/format-utils";
-import { useLang } from "@/hooks/use-lang";
+import { useLang } from "../../hooks/use-lang";
 
 interface Props {
   history: HistoryEntry[];

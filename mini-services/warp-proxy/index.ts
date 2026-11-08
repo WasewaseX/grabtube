@@ -1,19 +1,7 @@
-/**
- * WARP proxy mini-service.
- *
- * 1. Supervisor: runs wireproxy (userspace WireGuard → local SOCKS5) with the
- *    Cloudflare WARP profile in warp.conf; restarts it if it ever dies.
- * 2. HTTP CONNECT bridge on 127.0.0.1:41081: accepts standard HTTP CONNECT
- *    (undici ProxyAgent, ffmpeg http_proxy) and tunnels every connection
- *    through the wireproxy SOCKS5 endpoint on 127.0.0.1:41080.
- *
- * Endpoints:
- *   socks5://127.0.0.1:41080   (yt-dlp --proxy)
- *   http://127.0.0.1:41081     (Node fetch via ProxyAgent / ffmpeg env)
- *
- * Both share the same WARP egress IP, which keeps googlevideo's
- * IP-locked URLs consistent between URL minting and media fetching.
- */
+/** WARP proxy mini-service: (1) wireproxy supervisor (userspace WireGuard →
+ *  local SOCKS5 on 41080) and (2) an HTTP CONNECT bridge on 41081 tunnelling
+ *  through it. Both share one WARP egress IP so googlevideo's IP-locked URLs
+ *  stay consistent between URL minting and media fetching. */
 import { listen, connect, type Socket } from "bun";
 import { readFileSync, writeFileSync } from "node:fs";
 
@@ -32,11 +20,10 @@ let restarting = false;
 let restartDelayMs = 2000;
 const RESTART_DELAY_CAP = 60_000;
 
-/** WARP officially supports many UDP ports; networks sometimes throttle one,
- *  so we rotate automatically when handshakes stop completing. The
- *  registration API lists [2408, 500, 1701, 4500] — those go first.
- *  NOTE: this sandbox only completes handshakes on 928 (measured 2026-10-23
- *  sweep) — it MUST stay first or rotation walks into a death spiral. */
+/** WARP supports many UDP ports; networks throttle some, so we rotate when
+ *  handshakes stop completing (registration API ports listed first). NOTE:
+ *  this sandbox only completes handshakes on 928 — it MUST stay first or
+ *  rotation walks into a death spiral. */
 const ENDPOINT_PORTS = [928, 2408, 500, 1701, 4500, 854, 894, 1843, 2506, 939, 945, 903];
 let portIdx = Math.max(0, ENDPOINT_PORTS.indexOf(currentEndpointPort()));
 let handshakeFails = 0;
@@ -73,20 +60,25 @@ let ipIdx = 0;
  *  before wandering into untested combos (a known-good pair beats a roulette) */
 let lastGood: { ip: string; port: number } | null = null;
 
-function rotateEndpoint(reason: string) {
-  // snap back to the last proven-working pair before trying new combos
+/** snap back to the last proven-working pair before trying new combos */
+function trySnapBack(reason: string): boolean {
+  if (!lastGood) return false;
   const confIp = currentEndpointIp();
   const confPort = currentEndpointPort();
-  if (lastGood && (lastGood.ip !== confIp || lastGood.port !== confPort)) {
-    try {
-      const conf = readFileSync(CONF, "utf8");
-      writeFileSync(CONF, conf.replace(/^Endpoint = .*$/m, `Endpoint = ${lastGood.ip}:${lastGood.port}`));
-      console.log(`[warp-proxy] snapping back to known-good → ${lastGood.ip}:${lastGood.port} (${reason})`);
-      return;
-    } catch (e) {
-      console.error(`[warp-proxy] snap-back failed: ${String(e)}`);
-    }
+  if (lastGood.ip === confIp && lastGood.port === confPort) return false;
+  try {
+    const conf = readFileSync(CONF, "utf8");
+    writeFileSync(CONF, conf.replace(/^Endpoint = .*$/m, `Endpoint = ${lastGood.ip}:${lastGood.port}`));
+    console.log(`[warp-proxy] snapping back to known-good → ${lastGood.ip}:${lastGood.port} (${reason})`);
+    return true;
+  } catch (e) {
+    console.error(`[warp-proxy] snap-back failed: ${String(e)}`);
+    return false;
   }
+}
+
+function rotateEndpoint(reason: string) {
+  if (trySnapBack(reason)) return;
   portIdx = (portIdx + 1) % ENDPOINT_PORTS.length;
   const port = ENDPOINT_PORTS[portIdx];
   ipIdx = (ipIdx + 1) % ENDPOINT_IPS.length;
@@ -97,6 +89,39 @@ function rotateEndpoint(reason: string) {
     console.log(`[warp-proxy] rotating endpoint → ${ip}:${port} (${reason})`);
   } catch (e) {
     console.error(`[warp-proxy] rotate failed: ${String(e)}`);
+  }
+}
+
+/** a live session resets the failure counter only on traffic, which the
+ *  health prober measures — see probe loop below. Returns true when the batch
+ *  must stop being processed (escalation consumed it). */
+function handleWireproxyLine(l: string): boolean {
+  if (l.includes("Handshake did not complete")) {
+    handshakeFails++;
+    return maybeEscalateStuckHandshake();
+  }
+  if (l.includes("UDP bind has been updated") || l.includes("Received handshake response")) {
+    handshakeFails = 0;
+    lastHandshakeOk = Date.now();
+    markTunnelAlive();
+  }
+  return false;
+}
+
+/** stuck handshakes → rotate endpoint + restart the child */
+function maybeEscalateStuckHandshake(): boolean {
+  if (handshakeFails < 6 || Date.now() - lastHandshakeOk <= 60_000) return false;
+  handshakeFails = 0;
+  rotateEndpoint("handshake stuck");
+  killWireproxy();
+  return true;
+}
+
+function killWireproxy() {
+  try {
+    child?.kill(9);
+  } catch {
+    /* noop */
   }
 }
 
@@ -119,31 +144,14 @@ function startWireproxy() {
           const lines = line.split("\n");
           line = lines.pop() ?? "";
           for (const l of lines) {
-            if (l.includes("Handshake did not complete")) {
-              handshakeFails++;
-              if (handshakeFails >= 6 && Date.now() - lastHandshakeOk > 60_000) {
-                handshakeFails = 0;
-                rotateEndpoint("handshake stuck");
-                try {
-                  child?.kill(9);
-                } catch {
-                  /* noop */
-                }
-                break;
-              }
-            } else if (l.includes("UDP bind has been updated") || l.includes("Received handshake response")) {
-              // a live session resets the failure counter only on traffic,
-              // which the health prober measures — see probe loop below
-              handshakeFails = 0;
-              lastHandshakeOk = Date.now();
-              markTunnelAlive();
-            }
+            if (handleWireproxyLine(l)) break;
           }
         }
       })();
     };
-    if (child.stderr) watch(child.stderr);
-    if (child.stdout) watch(child.stdout);
+    const { stderr, stdout } = child;
+    if (typeof stderr !== "number" && stderr) watch(stderr);
+    if (typeof stdout !== "number" && stdout) watch(stdout);
 
     void child.exited.then((code) => {
       console.log(`[warp-proxy] wireproxy exited code=${code}`);
@@ -186,7 +194,7 @@ async function healthProbe() {
       markTunnelAlive();
       try {
         const m = readFileSync(CONF, "utf8").match(/^Endpoint = (\S+):(\d+)/m);
-        if (m) lastGood = { ip: m[1], port: m[2] };
+        if (m) lastGood = { ip: m[1], port: parseInt(m[2], 10) };
       } catch {
         /* noop */
       }
@@ -199,11 +207,7 @@ async function healthProbe() {
     if (Date.now() - lastHandshakeOk > 90_000) {
       rotateEndpoint("health probe dead");
       lastHandshakeOk = Date.now(); // avoid tight rotation loops
-      try {
-        child?.kill(9);
-      } catch {
-        /* noop */
-      }
+      killWireproxy();
     }
   }
 }

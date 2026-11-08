@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { existsSync } from "fs";
 
 import { ensureFileForLink, serveLocalFile, type LinkSpec } from "@/lib/file-link";
+import { headLegacyDownload, serveLegacyDownload } from "@/lib/legacy-download-file";
 import { findStoredByToken, parseLookupKey, touchStoredFile } from "@/lib/store";
 
 export const dynamic = "force-dynamic";
@@ -30,6 +31,10 @@ async function handle(req: Request, token: string): Promise<Response> {
 
   const stored = await findStoredByToken(token);
   if (!stored) {
+    /* Legacy fallback: ids handed out by the first-generation engine
+     * (/api/stress harness) resolve through db.download under the same slug. */
+    const legacy = await serveLegacyDownload(req, token);
+    if (legacy) return legacy;
     return NextResponse.json(
       { error: { code: "NOT_FOUND", message: "Unknown or expired file link." } },
       { status: 404 },
@@ -82,5 +87,9 @@ export async function GET(req: Request, ctx: { params: Promise<{ token: string }
 
 export async function HEAD(req: Request, ctx: { params: Promise<{ token: string }> }): Promise<Response> {
   const { token } = await ctx.params;
-  return handle(req, token);
+  const stored = await findStoredByToken(token).catch(() => null);
+  if (stored) return handle(req, token);
+  const legacy = await headLegacyDownload(token);
+  if (legacy) return legacy;
+  return handle(req, token); // re-runs handle → canonical 400/404 body
 }

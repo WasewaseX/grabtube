@@ -73,3 +73,5 @@ next-env.d.ts
 /mini-services/warp-proxy/wgcf-account.toml*
 /mini-services/warp-proxy/wgcf-profile.conf
 /mini-services/warp-proxy/warp.log
+tool-results .zscripts/dev.pid/
+verification/ *.bin tool-results/

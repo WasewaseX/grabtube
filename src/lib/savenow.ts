@@ -79,9 +79,7 @@ export function isSavenowSource(raw: { extractor_key?: string }): boolean {
   return /:savenow/i.test(raw.extractor_key || "");
 }
 
-/* ------------------------------------------------------------------ */
 /* HTTP + PoW                                                          */
-/* ------------------------------------------------------------------ */
 
 const JSON_HEADERS = { "User-Agent": UA, Accept: "application/json" } as const;
 
@@ -174,9 +172,7 @@ export async function powToken(force = false): Promise<string | null> {
   return st.inflight;
 }
 
-/* ------------------------------------------------------------------ */
 /* Start + poll                                                        */
-/* ------------------------------------------------------------------ */
 
 export interface SavenowStart {
   id: string;
@@ -306,9 +302,7 @@ export async function resolveSavenowUrl(
   return { url, title: start.title, thumbnail: start.thumbnail };
 }
 
-/* ------------------------------------------------------------------ */
 /* Info synthesis — full quality menu from ONE lightweight start call   */
-/* ------------------------------------------------------------------ */
 
 const HEIGHTS: Record<string, number> = {
   "144": 144,

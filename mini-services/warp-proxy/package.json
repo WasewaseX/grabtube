@@ -4,5 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "bun run index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0"
   }
 }

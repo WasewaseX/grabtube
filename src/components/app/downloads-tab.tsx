@@ -7,7 +7,7 @@ import { Progress } from "@/components/ui/progress";
 import type { DownloadItem } from "@/hooks/use-downloader";
 import { errorKey } from "@/lib/i18n";
 import { formatBytes, formatSpeed } from "@/lib/format-utils";
-import { useLang } from "@/hooks/use-lang";
+import { useLang } from "../../hooks/use-lang";
 
 interface Props {
   items: DownloadItem[];

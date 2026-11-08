@@ -1,0 +1,20 @@
+{
+  "Version": "v4.0.2",
+  "Exclude": [
+    "^public/demo/",
+    "^db/",
+    "^tools/",
+    "^downloads/",
+    "^node_modules/",
+    "^\\.next/",
+    "^bun\\.lock$",
+    "^package-lock\\.json$",
+    "^\\.zscripts/",
+    "^mini-services/pot-provider/",
+    "^skills/",
+    "^examples/",
+    "^verification/",
+    "^_ci/",
+    "^tool-results/"
+  ]
+}

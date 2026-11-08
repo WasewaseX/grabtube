@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "bun run index.ts"
+    "dev": "bun run index.ts",
+    "lint": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/bun": "^1.2.0"

@@ -64,6 +64,7 @@
     "framer-motion": "^12.23.2",
     "input-otp": "^1.4.2",
     "lucide-react": "^0.525.0",
+    "minimatch": "^11.0.1",
     "next": "^16.4.5",
     "next-auth": "^4.24.15",
     "next-intl": "^4.9.2",
@@ -85,7 +86,7 @@
     "uuid": "^11.1.1",
     "vaul": "^1.1.2",
     "z-ai-web-dev-sdk": "^0.0.18",
-    "zod": "^4.0.2",
+    "zod": "^4.6.6",
     "zustand": "^5.0.6"
   },
   "devDependencies": {
@@ -112,6 +113,15 @@
     "postcss": "^8.5.18",
     "source-map-js": "^1.2.2",
     "prismjs": "^1.30.0",
-    "diff": "^5.2.2"
+    "diff": "^5.2.2",
+    "brace-expansion@1": "1.1.21",
+    "brace-expansion@2": "2.1.7",
+    "@babel/core": "^7.29.6",
+    "@humanfs/node": "^0.16.8",
+    "baseline-browser-mapping": "^2.11.0",
+    "browserslist": "^4.28.7",
+    "flatted": "^3.4.2",
+    "minimatch": "^11.0.1",
+    "ajv": "^6.14.0"
   }
 }

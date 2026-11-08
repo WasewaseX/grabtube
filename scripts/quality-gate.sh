@@ -11,8 +11,7 @@
 # this script is the cheap pre-commit prevention layer.
 set -uo pipefail
 
-cd "$(dirname "$0")/.."
-ROOT="$(pwd)"
+cd "$(dirname "$0")/.." || exit 1
 fail=0
 
 step() { printf '\n\033[1;36m[gate]\033[0m %s\n' "$1"; }
@@ -36,7 +35,8 @@ if command -v shellcheck >/dev/null 2>&1; then
   while IFS= read -r f; do
     shellcheck -S error "$f" || sh_ok=0
   done < <(rg --files -g '*.sh' -g '!node_modules' -g '!tools' -g '!downloads')
-  [ "$sh_ok" = 1 ] && ok "shell scripts clean" || bad "shellcheck findings"
+  [ "$sh_ok" = 1 ] && ok "shell scripts clean"
+  [ "$sh_ok" = 1 ] || bad "shellcheck findings"
 else
   ok "shellcheck not installed locally — CI enforces it"
 fi

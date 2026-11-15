@@ -22,7 +22,7 @@ on:
 
 jobs:
   master:
-    uses: WasewaseX/master-ci/.github/workflows/master-ci.yml@v1.16.0
+    uses: WasewaseX/master-ci/.github/workflows/master-ci.yml@v1.21.0
     with:
       profile: strict
       template_repo: WasewaseX/master-ci
@@ -34,7 +34,7 @@ jobs:
       id-token: write
 
   codeql:
-    uses: WasewaseX/master-ci/.github/workflows/codeql.yml@v1.16.0
+    uses: WasewaseX/master-ci/.github/workflows/codeql.yml@v1.21.0
     with:
       languages: javascript-typescript
     permissions:
